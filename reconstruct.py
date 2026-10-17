@@ -1,24 +1,13 @@
 import os
 import sys
 import subprocess
-import types
 
-# ХАК ДЛЯ ОБХОДУ БЛОКУВАННЯ XFORMERS НА WINDOWS:
-# Створюємо фейковий модуль у пам'яті, щоб застарілий код Meta не падав при імпорті
-if 'xformers' not in sys.modules:
-    fake_xformers = types.ModuleType('xformers')
-    fake_xformers.ops = types.ModuleType('ops')
-    # Заглушка для методу memory_efficient_attention, якщо модель спробує його викликати
-    fake_xformers.ops.memory_efficient_attention = None
-    sys.modules['xformers'] = fake_xformers
-    sys.modules['xformers.ops'] = fake_xformers.ops
-
-# Тепер імпорти пройдуть без жодних помилок 'ModuleNotFoundError'
 import torch
 import numpy as np
 from scipy.io import wavfile
 from audiocraft.models import MusicGen
-from audiocraft.data.audio import audio_write
+import torchaudio
+from audiocraft.data.audio_utils import normalize_audio
 
 # ==================== НАЛАШТУВАННЯ META AI ====================
 MODEL_NAME = 'facebook/musicgen-melody-large'
@@ -71,35 +60,43 @@ def main():
     # Вирівнюємо розмірність під вимоги Meta AI [channels, samples]
     if len(melody_tensor.shape) == 1:
         melody_tensor = melody_tensor.unsqueeze(0)
-    elif len(melody_tensor.shape) == 2 and melody_tensor.shape[1] > melody_tensor.shape[0]:
-        melody_tensor = melody_tensor.T
+    elif len(melody_tensor.shape) == 2:
+        # scipy.io.wavfile повертає [samples, channels]
+        melody_tensor = melody_tensor.T.contiguous()
 
     duration = int(melody_tensor.shape[1] / sr)
     
     # Передаємо параметри генерації в модель
-    model.set_generation_params(duration=duration, cfg_scale=CFG_SCALE)
+    model.set_generation_params(duration=duration, cfg_coef=CFG_SCALE)
 
     print(f"🔥 АКТИВАЦІЯ CUDA: Повний прорахунок треку ({duration} сек.) на ядрах RTX 4080...")
     with torch.no_grad():
         # Рідний метод хрома-структур Meta AI. Працює суто на відеокарті!
         outputs = model.generate_with_chroma([prompt], melody_tensor[None].to('cuda'), sr)
 
-    # Переносимо результат і зберігаємо тимчасовий рок-фон
+    # Нормалізуємо гучність без ffmpeg і зберігаємо рок-фон окремо (проміжний результат)
     new_rock_bg = outputs.cpu().squeeze(0)
-    audio_write("temp_meta_rock", new_rock_bg, model.sample_rate, strategy="loudness", loudness_compressor=True)
+    new_rock_bg = normalize_audio(new_rock_bg, strategy="loudness", loudness_compressor=True,
+                                  sample_rate=model.sample_rate)
+    rock_path = os.path.join(target_folder, f"{song_name}_rock_only.wav")
+    wavfile.write(rock_path, rate=model.sample_rate,
+                  data=(new_rock_bg.mean(dim=0).clamp(-1, 1).numpy() * 32767.0).astype(np.int16))
 
     # 3. Фінальне зведення
     print("3/3. Зведення нового року з оригінальним вокалом...")
     v_sr, vocals_data = wavfile.read(VOCALS_PATH)
-    r_sr, rock_data = wavfile.read("temp_meta_rock.wav")
 
     vocals_tensor = torch.from_numpy(vocals_data).float()
+    if vocals_data.dtype == np.int16:
+        vocals_tensor = vocals_tensor / 32768.0
+    elif vocals_data.dtype == np.int32:
+        vocals_tensor = vocals_tensor / 2147483648.0
     if len(vocals_tensor.shape) > 1:
         vocals_tensor = vocals_tensor.mean(dim=1)
 
-    rock_tensor = torch.from_numpy(rock_data).float()
-    if len(rock_tensor.shape) > 1:
-        rock_tensor = rock_tensor.mean(dim=1)
+    # MusicGen видає 32 кГц, вокал має іншу частоту - приводимо рок до частоти вокалу
+    rock_tensor = new_rock_bg.mean(dim=0)
+    rock_tensor = torchaudio.functional.resample(rock_tensor, model.sample_rate, v_sr)
 
     min_len = min(vocals_tensor.shape[0], rock_tensor.shape[0])
     final_mix = vocals_tensor[:min_len] + rock_tensor[:min_len]
@@ -109,10 +106,7 @@ def main():
         final_mix = final_mix / max_val
 
     output_path = os.path.join(target_folder, f"{song_name}_RECONSTRUCTED.wav")
-    wavfile.write(output_path, rate=r_sr, data=(final_mix.numpy() * 32767.0).astype(np.int16))
-
-    if os.path.exists("temp_meta_rock.wav"):
-        os.remove("temp_meta_rock.wav")
+    wavfile.write(output_path, rate=v_sr, data=(final_mix.numpy() * 32767.0).astype(np.int16))
 
     print("\n=======================================================")
     print("🎉 УСПІХ! ОФІЦІЙНИЙ КОД META AI ПОВНІСТЮ ЗГЕНЕРУВАВ ТРЕК!")
