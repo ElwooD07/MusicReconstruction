@@ -20,14 +20,15 @@ if not exist "env" (
 echo Activating local environment...
 call env\Scripts\activate.bat
 
-:: 3. Set mmodels directory
+:: 3. Set models directory
 if not exist "E:\Models" (
     echo Creating directory for models E:\Models...
     mkdir "E:\Models"
 )
 set "HF_HOME=E:\Models"
-set "AUDIOCRAFT_CACHE_DIR=E:\Models"
-echo The directory for models is set to %HF_HOME%
+echo The directory for huggingface is set to %HF_HOME%
+set "AUDIOCRAFT_CACHE_DIR=%HF_HOME%\audiocraft"
+set "TORCH_HOME=%HF_HOME%\torch"
 
 :: 4. Install components
 echo Installing components...
@@ -43,7 +44,7 @@ pip install av --only-binary=:all: --upgrade --quiet
 echo   -[3/4] Installing Meta AudioCraft...
 pip install audiocraft --no-deps --quiet
 pip install omegaconf hydra-core einops local-attention treetable submitit sentencepiece encodec flashy num2words spacy gradio torchmetrics hydra-colorlog librosa scipy --quiet
-pip install av julius transformers demucs
+pip install av julius transformers demucs xformers
 
 echo   -[4/4] Clearing pip installation cache...
 pip cache purge --quiet
