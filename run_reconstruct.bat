@@ -18,7 +18,7 @@ if not exist "env" (
 )
 
 echo Activating local environment...
-call music_env\Scripts\activate.bat
+call env\Scripts\activate.bat
 
 :: 3. Set mmodels directory
 if not exist "E:\Models" (
