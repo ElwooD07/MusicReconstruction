@@ -1,1 +1,7 @@
 env
+ace-step/
+temp
+__pycache__/
+models/
+# personal, per-machine Claude Code overrides (the shared .claude/settings.json is committed on purpose)
+.claude/settings.local.json

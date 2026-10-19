@@ -12,18 +12,28 @@ from audiocraft.data.audio_utils import normalize_audio
 # ==================== НАЛАШТУВАННЯ META AI ====================
 MODEL_NAME = 'facebook/musicgen-melody-large'
 CFG_SCALE = 3.8
-DEFAULT_PROMPT = "Modern hard rock track, heavy overdriven electric guitars, punchy modern drums, thick bassline, professional stadium rock mix, keeping original harmony"
+PROMPT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prompts', 'default.txt')
 # ==============================================================
 
+def load_prompt(arg):
+    # Промпт: аргумент командного рядка, інакше вміст prompts/default.txt (у коді тексту немає)
+    if arg and arg.strip():
+        return arg.strip()
+    if not os.path.exists(PROMPT_FILE):
+        print(f"❌ Помилка: не вказано промпт і немає файлу {PROMPT_FILE}")
+        sys.exit(1)
+    with open(PROMPT_FILE, encoding='utf-8') as f:
+        return f.read().strip()
+
 def main():
-    print("\n--- 🚀 Старт оригінального фреймворку Meta AudioCraft на RTX 4080 ---")
+    print("\n--- 🚀 Старт оригінального фреймворку Meta AudioCraft на GPU ---")
     
     if len(sys.argv) < 2:
         print("❌ Помилка: Не вказано папку з файлом!")
         sys.exit(1)
 
     target_folder = os.path.abspath(sys.argv[1])
-    prompt = sys.argv[2] if len(sys.argv) >= 3 and sys.argv[2].strip() else DEFAULT_PROMPT
+    prompt = load_prompt(sys.argv[2] if len(sys.argv) >= 3 else None)
 
     if not os.path.exists(target_folder):
         print("❌ Помилка: Папку не знайдено!")
@@ -69,7 +79,7 @@ def main():
     # Передаємо параметри генерації в модель
     model.set_generation_params(duration=duration, cfg_coef=CFG_SCALE)
 
-    print(f"🔥 АКТИВАЦІЯ CUDA: Повний прорахунок треку ({duration} сек.) на ядрах RTX 4080...")
+    print(f"🔥 АКТИВАЦІЯ CUDA: Повний прорахунок треку ({duration} сек.) на ядрах GPU...")
     with torch.no_grad():
         # Рідний метод хрома-структур Meta AI. Працює суто на відеокарті!
         outputs = model.generate_with_chroma([prompt], melody_tensor[None].to('cuda'), sr)
