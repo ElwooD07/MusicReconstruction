@@ -1,18 +1,21 @@
-"""Tuning UI: pick a song, pick a reference sound, generate with ACE-Step, mix and listen at once.
+"""UI of route B: replay the song with REAL samples cut from reference tracks, and listen at once.
 
-Run through the launcher (ACE-Step venv, models on MODELS_DIR):
+Run through the launcher (main env):
     run.bat ui [--port 7860] [--no-browser]
 
-Working folder = the folder that holds the song you pick ("root"):
+Working folder ("root") = a folder named after the song, next to it (<dir>/<song>/ for <dir>/<song>.mp3; a song
+that already lies in a folder of its own name uses that folder). The song file itself is never moved or copied:
     <root>/orig/        all stems of the song (made automatically, once)
     <root>/reference/   all stems of every reference track (made automatically, once)
-    <root>/gen/         every generated track with a JSON sidecar of its settings
-    <root>/<song>-<date>-<time>.wav   the mixed results
+    <root>/native/bank/ samples cut from the references: drums/*.wav, guitar/*.wav (listen, delete the bad ones)
+    <root>/native/out/  the arrangements
+The work itself is in tools/native_bank.py, tools/native_song.py, tools/native_arrange.py (also usable without the UI).
 """
 import argparse
+import contextlib
 import functools
-import gc
 import glob
+import io
 import json
 import os
 import re
@@ -22,38 +25,29 @@ import sys
 import time
 
 import gradio as gr
-import numpy as np
 import soundfile as sf
-import torch
-import torchaudio
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-ACESTEP_DIR = os.path.abspath(os.environ.get("ACESTEP_DIR") or os.path.join(ROOT, "ace-step"))
-sys.path.insert(0, ACESTEP_DIR)
-os.environ.setdefault("ACESTEP_PROJECT_ROOT", ACESTEP_DIR)
+sys.path.insert(0, os.path.join(ROOT, "tools"))
 
-from acestep.handler import AceStepHandler  # noqa: E402
-from acestep.inference import GenerationConfig, GenerationParams, generate_music  # noqa: E402
-from acestep.llm_inference import LLMHandler  # noqa: E402
-from acestep.model_downloader import ensure_dit_model, ensure_main_model, get_checkpoints_dir  # noqa: E402
+import native_arrange  # noqa: E402
+import native_bank  # noqa: E402
 
-SR = 48000
-UI_DIR = os.path.join(ROOT, "temp", "ui")        # scratch: context file, model output before it is copied
-STATE_FILE = os.path.join(UI_DIR, "state.json")  # remembers the last song / reference
-MAIN_PYTHON = os.path.join(ROOT, "env", "Scripts", "python.exe")
-STEMS = ["vocals", "drums", "bass", "other"]
-TRACKS = ["guitar", "keyboard", "synth", "strings", "percussion", "drums", "bass", "fx", "brass", "woodwinds"]
-MODELS = ["acestep-v15-base", "acestep-v15-sft", "acestep-v15-turbo"]
-REF_STEM_CHOICES = [("вокал", "vocals"), ("барабани", "drums"), ("бас", "bass"),
-                    ("інше (гітари, клавіші)", "other"), ("весь мікс", "full")]
+UI_DIR = os.path.join(ROOT, "temp", "ui")        # scratch: player copies, the remembered song
+STATE_FILE = os.path.join(UI_DIR, "state.json")
+PLAY_DIR = os.path.join(UI_DIR, "play")
+AUDIO_EXT = {".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus", ".wma"}
+STOP_JS = "() => document.querySelectorAll('audio').forEach(a => { a.pause(); a.currentTime = 0; })"
+HEAD = """<script>
+/* one sound at a time: starting any player pauses the others */
+document.addEventListener('play', e => document.querySelectorAll('audio').forEach(a => { if (a !== e.target) a.pause(); }), true);
+</script>"""
 os.makedirs(UI_DIR, exist_ok=True)
 
-_cache = {}
-_engine = {"model": None, "handler": None, "llm": LLMHandler()}
 state = {"base": None, "root": None, "name": None, "duration": 200.0}
 
 
-# ----------------------------------------------------------------------------------------- files & audio
+# ----------------------------------------------------------------------------------------- files & players
 def save_state(**kw):
     s = json.load(open(STATE_FILE, encoding="utf-8")) if os.path.exists(STATE_FILE) else {}
     s.update(kw)
@@ -64,38 +58,29 @@ def slug(path):
     return re.sub(r"[^a-z0-9]+", "_", os.path.splitext(os.path.basename(path))[0].lower()).strip("_") or "track"
 
 
-def orig_dir():
-    return os.path.join(state["root"], "orig")
+def song_root(path):
+    """Working folder of a song: <its dir>/<song name>/, or its own dir when that is already named after the song."""
+    path = os.path.abspath(path)
+    parent, stem = os.path.dirname(path), os.path.splitext(os.path.basename(path))[0]
+    if os.path.normcase(os.path.basename(parent)) == os.path.normcase(stem):
+        return parent
+    return os.path.join(parent, stem)
 
 
 def ref_dir(name):
     return os.path.join(state["root"], "reference", name)
 
 
+def bank_dir():
+    return os.path.join(state["root"], "native", "bank")
+
+
 def demux(audio, out_dir):
-    """All stems via the main env (demucs lives there); a finished folder is reused."""
-    r = subprocess.run([MAIN_PYTHON, os.path.join(ROOT, "tools", "demux.py"), audio, out_dir],
+    """All stems (demucs lives in this env); a finished folder is reused."""
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "demux.py"), audio, out_dir],
                        capture_output=True, text=True, cwd=ROOT)
     if r.returncode:
         raise gr.Error(f"demux failed: {r.stderr[-400:]}")
-
-
-def load_audio(path, start=0.0, end=None, sr=SR):
-    """Stereo float32 [n, 2] at `sr` for [start, end) seconds (the last resampled file is cached)."""
-    key = (path, os.path.getmtime(path), sr)
-    if key not in _cache:
-        y, s = sf.read(path, dtype="float32", always_2d=True)
-        y = np.repeat(y, 2, axis=1) if y.shape[1] == 1 else y[:, :2]
-        if s != sr:
-            y = torchaudio.functional.resample(torch.from_numpy(y.T), s, sr).T.numpy()
-        _cache.clear()
-        _cache[key] = y
-    return _cache[key][int(start * sr):int(end * sr) if end else None]
-
-
-def soft_limit(x, knee=0.8):
-    a = np.abs(x)
-    return np.where(a > knee, np.sign(x) * (knee + (1 - knee) * np.tanh((a - knee) / (1 - knee))), x).astype(np.float32)
 
 
 def friendly(fn):
@@ -106,79 +91,130 @@ def friendly(fn):
             return fn(*a, **k)
         except gr.Error:
             raise
+        except SystemExit as e:                      # the tools report problems with sys.exit(text)
+            raise gr.Error(str(e)) from e
         except Exception as e:
             raise gr.Error(f"{type(e).__name__}: {e}") from e
     return wrapper
 
 
+def need_song():
+    if not state["root"]:
+        raise gr.Error("Спочатку оберіть пісню.")
+
+
 def playable(path):
-    """Gradio only serves files from the project folder or the system temp: give the player a copy of files that
-    live in the song's root folder (the files themselves stay where they are)."""
-    play = os.path.join(UI_DIR, "play")
-    os.makedirs(play, exist_ok=True)
-    out = os.path.join(play, f"{int(time.time() * 1000)}_{os.path.basename(path)}")
+    """Gradio only serves files from the project folder or the system temp: the player gets a copy."""
+    os.makedirs(PLAY_DIR, exist_ok=True)
+    out = os.path.join(PLAY_DIR, f"{int(time.time() * 1000)}_{os.path.basename(path)}")
     shutil.copyfile(path, out)
-    for old in sorted(glob.glob(os.path.join(play, "*.wav")))[:-16]:  # keep the last 16 copies
+    for old in sorted(glob.glob(os.path.join(PLAY_DIR, "*.wav")))[:-16]:
         os.remove(old)
     return out
 
 
-@friendly
-def browse(title):
-    """Native file dialog (the UI runs on this machine)."""
+def to_player(path, label):
+    """Outputs for [player, now-playing line]: the file goes into the player and starts at once."""
+    return gr.update(value=playable(path), autoplay=True), f"▶ **{label}**"
+
+
+def pick(title, folder=False):
+    """Native file / folder dialog (the UI runs on this machine); '' when cancelled or when there is no tkinter."""
     try:
         from tkinter import Tk, filedialog
         tk = Tk()
         tk.withdraw()
         tk.attributes("-topmost", True)
-        p = filedialog.askopenfilename(title=title, filetypes=[("Audio", "*.mp3 *.wav *.flac *.wma *.m4a *.ogg"),
-                                                               ("All files", "*.*")])
+        if folder:
+            p = filedialog.askdirectory(title=title)
+        else:
+            p = filedialog.askopenfilename(title=title, filetypes=[("Audio", "*.mp3 *.wav *.flac *.wma *.m4a *.ogg"),
+                                                                   ("All files", "*.*")])
         tk.destroy()
-        return p or gr.update()
+        return p or ""
     except Exception as e:  # no tkinter: the path can still be pasted
         gr.Warning(f"file dialog unavailable ({e}); paste the path instead")
-        return gr.update()
+        return ""
+
+
+@friendly
+def browse(title):
+    return pick(title) or gr.update()
 
 
 @friendly
 def open_root():
-    if not state["root"]:
-        raise gr.Error("Спочатку оберіть пісню.")
+    need_song()
     os.startfile(state["root"])
 
 
+@friendly
+def open_bank():
+    need_song()
+    os.makedirs(bank_dir(), exist_ok=True)
+    os.startfile(bank_dir())
+
+
+# ----------------------------------------------------------------------------------------- song
 def reference_names():
     if not state["root"]:
         return []
     return sorted(os.path.basename(os.path.dirname(p))
-                  for p in glob.glob(os.path.join(state["root"], "reference", "*", "full.wav")))
+                  for p in glob.glob(os.path.join(state["root"], "reference", "*", "drums.wav")))
 
 
-def history():
+def bank_tracks():
+    """Reference tracks that are in the bank."""
     if not state["root"]:
         return []
-    items = []
-    for j in sorted(glob.glob(os.path.join(state["root"], "gen", "*.json")), reverse=True):
-        m = json.load(open(j, encoding="utf-8"))
-        items.append((f"{os.path.basename(j)[:-5]} | {m['task']} {m['track']} | сід {m['seed']} | кроки {m['steps']} | "
-                      f"зразок: {m['ref'] or '—'} | {m['caption'][:35]}", j))
-    return items
+    return sorted(os.path.basename(os.path.dirname(p)) for p in glob.glob(os.path.join(bank_dir(), "*", "index.json")))
 
 
-def song_status():
-    if not state["base"]:
-        return "Пісню не обрано."
-    return f"Пісня: {os.path.basename(state['base'])} ({state['duration']:.0f} с). Стеми готові ✓"
+def bank_samples():
+    """[(label, path)] of the samples that are still in the bank folders."""
+    out = []
+    for t in bank_tracks():
+        for s in json.load(open(os.path.join(bank_dir(), t, "index.json"), encoding="utf-8"))["samples"]:
+            p = os.path.join(bank_dir(), t, s["file"])
+            if os.path.exists(p):
+                what = s["kind"] if s["kind"] != "guitar" else f"гітара {native_bank.NOTES[s['root']]} {s['len_class']}"
+                out.append((f"{t[:24]} · {what} · {os.path.basename(p)}", p))
+    return out
+
+
+def outputs():
+    if not state["root"]:
+        return []
+    files = sorted(glob.glob(os.path.join(state["root"], "native", "out", "*.wav")), key=os.path.getmtime, reverse=True)
+    return [(os.path.basename(f), f) for f in files]
 
 
 def song_updates():
-    """Values for every control that depends on the loaded song."""
+    """Values for every control that depends on the loaded song (see `song_out` in build())."""
     d = int(state["duration"])
-    h = history()
-    return (state["root"] or "—", song_status(),
-            gr.update(maximum=d, value=min(40, d)), gr.update(maximum=d, value=min(100, d)),
-            gr.update(choices=reference_names(), value=(reference_names() or [None])[0]),
-            gr.update(choices=h, value=h[0][1] if h else None), gr.update(choices=h, value=h[1][1] if len(h) > 1 else None))
+    refs, tracks, outs = reference_names(), bank_tracks(), outputs()
+    best_d, best_g = native_arrange.best_tracks(state["root"]) if tracks else (None, None)
+    return (state["root"] or "", gr.update(value=map_rows()),
+            gr.update(maximum=d, value=min(40, max(d - 20, 0))),
+            gr.update(choices=refs, value=refs), gr.update(choices=refs, value=None),
+            gr.update(choices=tracks, value=best_d), gr.update(choices=tracks, value=best_g),
+            gr.update(choices=tracks, value=None), gr.update(choices=tracks, value=None),
+            gr.update(choices=bank_samples(), value=None),
+            gr.update(choices=outs, value=outs[0][1] if outs else None), bank_status())
+
+
+def bank_status():
+    if not state["root"]:
+        return ""
+    n_ref, n_bank = len(reference_names()), len(bank_tracks())
+    return f"Зразків зі стемами: {n_ref}; у банку: {n_bank}." if n_ref else "Зразків ще немає: додайте їх у блоці 2."
+
+
+def set_song(path):
+    root = song_root(path)
+    state.update(base=path, root=root, name=os.path.splitext(os.path.basename(path))[0],
+                 duration=sf.info(os.path.join(root, "orig", "full.wav")).duration)
+    save_state(base=path)
 
 
 @friendly
@@ -187,325 +223,395 @@ def load_song(path, progress=gr.Progress()):
     if not os.path.isfile(path):
         raise gr.Error("Файл пісні не знайдено. Натисніть «Огляд…» або вставте повний шлях.")
     progress(0.1, desc="Розділення на стеми (один раз, ~1-2 хв)…")
-    root = os.path.dirname(os.path.abspath(path))
-    demux(path, os.path.join(root, "orig"))
-    state.update(base=path, root=root, name=os.path.splitext(os.path.basename(path))[0],
-                 duration=sf.info(os.path.join(root, "orig", "full.wav")).duration)
-    save_state(base=path)
+    demux(path, os.path.join(song_root(path), "orig"))
+    set_song(path)
     return song_updates()
-
-
-@friendly
-def load_reference(path, progress=gr.Progress()):
-    if not state["root"]:
-        raise gr.Error("Спочатку оберіть пісню: зразки зберігаються в її кореневій папці.")
-    path = (path or "").strip().strip('"')
-    if not os.path.isfile(path):
-        raise gr.Error("Файл зразка не знайдено.")
-    progress(0.1, desc="Розділення зразка на стеми…")
-    name = slug(path)
-    demux(path, ref_dir(name))
-    return gr.update(choices=reference_names(), value=name), f"Зразок «{name}» готовий ✓"
-
-
-def build_context(gains, start, end):
-    parts = [load_audio(os.path.join(orig_dir(), f"{k}.wav"), start, end) * g for k, g in zip(STEMS, gains) if g > 0]
-    if not parts:
-        raise gr.Error("У контексті всі повзунки на нулі: моделі нічого «слухати».")
-    n = min(len(p) for p in parts)
-    ctx = sum(p[:n] for p in parts)
-    ctx = ctx / max(1.0, float(np.abs(ctx).max()))
-    path = os.path.join(UI_DIR, "ctx.wav")
-    sf.write(path, ctx, SR)
-    return path
-
-
-def cut_reference(name, stems, start):
-    """Exactly 30 s (looped if shorter) of the chosen reference stems from `start`; ACE-Step's own choice of
-    3 random 10 s pieces is avoided."""
-    mix = None
-    for s in stems:
-        y = load_audio(os.path.join(ref_dir(name), f"{s}.wav"))
-        n = len(y) if mix is None else min(len(mix), len(y))
-        mix = y[:n] if mix is None else mix[:n] + y[:n]
-    need = 30 * SR
-    mix = np.concatenate([mix] * int(np.ceil((start * SR + need) / len(mix))))
-    seg = mix[int(start * SR):int(start * SR) + need]
-    seg = seg / max(1e-6, float(np.abs(seg).max())) * 0.9
-    path = os.path.join(UI_DIR, f"ref_{int(time.time() * 1000)}.wav")
-    sf.write(path, seg, SR)
-    return path
-
-
-# ----------------------------------------------------------------------------------------- generation
-# Free VRAM (GiB) at model-load time below which the model parts are offloaded to the CPU. Measured with a hard
-# 8 GB cap: Lego of 60 s peaks at 7.8 GB without offload and at 5.1 GB with it (the same generation, 14 s vs 27 s).
-OFFLOAD_BELOW_GIB = 7.5
-
-
-def get_handler(model):
-    if _engine["model"] != model:
-        _engine["handler"] = None
-        gc.collect()
-        torch.cuda.empty_cache()
-        free_gib = torch.cuda.mem_get_info()[0] / 1024 ** 3
-        offload = free_gib < OFFLOAD_BELOW_GIB
-        if offload:
-            gr.Info(f"Вільної відеопам'яті {free_gib:.1f} ГБ (< {OFFLOAD_BELOW_GIB}): модель працює з вивантаженням на CPU, "
-                    f"повільніше, але вміщається.")
-        ckpt = get_checkpoints_dir()
-        ok, msg = ensure_main_model(checkpoints_dir=ckpt)
-        if ok and model != "acestep-v15-turbo":
-            ok, msg = ensure_dit_model(model, checkpoints_dir=ckpt)
-        if not ok:
-            raise gr.Error(f"модель {model}: {msg}")
-        h = AceStepHandler()
-        status, ok = h.initialize_service(project_root=ACESTEP_DIR, config_path=model, device="cuda",
-                                          offload_to_cpu=offload, offload_dit_to_cpu=offload)
-        if not ok:
-            raise gr.Error(f"не вдалося запустити модель: {status}")
-        _engine.update(model=model, handler=h, offload=offload)
-    return _engine["handler"]
-
-
-def generate(task, common, extra, progress):
-    (model, caption, steps, guidance, seed, count, start, end, g_voc, g_drm, g_bas, g_oth,
-     use_ref, ref_name, ref_stems, ref_start) = common
-    if not state["root"]:
-        raise gr.Error("Спочатку оберіть пісню (блок «1. Пісня»).")
-    if end <= start:
-        raise gr.Error("Кінець фрагмента має бути пізніше за початок.")
-    if use_ref and not (ref_name and ref_stems):
-        raise gr.Error("Увімкнено зразок, але не обрано зразок або його доріжки.")
-    ctx = build_context([g_voc, g_drm, g_bas, g_oth], start, end)
-    ref = cut_reference(ref_name, ref_stems, ref_start) if use_ref else None
-    handler = get_handler(model)
-    gen_dir = os.path.join(state["root"], "gen")
-    os.makedirs(gen_dir, exist_ok=True)
-    for i in range(int(count)):
-        sd = int(seed) + i
-        progress((i, int(count)), desc=f"сід {sd}")
-        kw = dict(task_type=task, src_audio=ctx, caption=caption, lyrics="[Instrumental]",
-                  instrumental=(task == "cover"), duration=-1, seed=sd, thinking=False,
-                  inference_steps=int(steps), guidance_scale=float(guidance))
-        if task == "lego":
-            track, rep_start, rep_end = extra
-            kw.update(instruction=f"Generate the {track} track based on the audio context:")
-            if rep_start > 0 or rep_end != -1:
-                kw.update(repainting_start=float(rep_start), repainting_end=float(rep_end))
-        else:
-            track = "cover"
-            noise, strength = extra
-            kw.update(audio_cover_strength=float(strength), cover_noise_strength=float(noise))
-        if ref:
-            kw.update(reference_audio=ref)
-        t0 = time.time()
-        res = generate_music(handler, _engine["llm"], GenerationParams(**kw),
-                             GenerationConfig(batch_size=1, audio_format="wav", use_random_seed=False, seeds=[sd]),
-                             save_dir=os.path.join(UI_DIR, "tmp"))
-        if not res.success:
-            raise gr.Error(f"сід {sd}: {getattr(res, 'error', res)}")
-        gid = time.strftime("%Y%m%d-%H%M%S") + f"_s{sd}"
-        out = os.path.join(gen_dir, f"{gid}.wav")
-        shutil.copyfile(res.audios[0]["path"], out)
-        meta = dict(task=task, track=track, seed=sd, steps=int(steps), guidance=guidance, caption=caption, start=start,
-                    end=end, ref=(f"{ref_name}:{'+'.join(ref_stems)}@{ref_start:.0f}с" if ref else ""),
-                    ctx_gains=[g_voc, g_drm, g_bas, g_oth], wav=out, model=model, took=round(time.time() - t0, 1),
-                    root=state["root"], name=state["name"], extra=list(extra))
-        json.dump(meta, open(os.path.join(gen_dir, f"{gid}.json"), "w", encoding="utf-8"), indent=1)
-    h = history()
-    return (playable(out), gr.update(choices=h, value=h[0][1]), gr.update(choices=h, value=h[1][1] if len(h) > 1 else None),
-            ref, f"Готово: {int(count)} варіант(ів), останній за {meta['took']} с")
-
-
-@friendly
-def gen_lego(*a, progress=gr.Progress()):
-    return generate("lego", a[:16], a[16:], progress)
-
-
-@friendly
-def gen_cover(*a, progress=gr.Progress()):
-    return generate("cover", a[:16], a[16:], progress)
-
-
-# ----------------------------------------------------------------------------------------- mix
-def pan(y, p):
-    """Mono-sum equal-power pan (-1..1); 0 keeps the stereo file as it is."""
-    if p == 0:
-        return y
-    m = y.mean(1, keepdims=True)
-    a = (p + 1) * np.pi / 4
-    return np.concatenate([m * np.cos(a), m * np.sin(a)], 1)
-
-
-@friendly
-def mix(a_json, b_json, m_voc, m_drm, m_bas, m_oth, m_a, m_b, p_a, p_b, master):
-    if not a_json:
-        raise gr.Error("Оберіть гітару A (спершу згенеруйте щось).")
-    ma = json.load(open(a_json, encoding="utf-8"))
-    root = ma["root"]  # the stems of the song THIS generation was made for
-    layers = [load_audio(os.path.join(root, "orig", f"{k}.wav"), ma["start"], ma["end"]) * g
-              for k, g in zip(STEMS, [m_voc, m_drm, m_bas, m_oth]) if g > 0]
-    for j, g, p in [(a_json, m_a, p_a), (b_json, m_b, p_b)]:
-        if j and g > 0:
-            layers.append(pan(load_audio(json.load(open(j, encoding="utf-8"))["wav"]), p) * g)
-    n = min(len(x) for x in layers)
-    out = soft_limit(sum(x[:n] for x in layers) * master)
-    path = os.path.join(root, f"{ma['name']}-{time.strftime('%Y%m%d-%H%M%S')}.wav")
-    sf.write(path, out, SR)
-    return playable(path), f"Збережено в кореневу папку: {os.path.basename(path)} ({n / SR:.0f} с, пік {np.abs(out).max():.2f})"
-
-
-# ----------------------------------------------------------------------------------------- UI
-def preset_choices():
-    out = []
-    for p in sorted(glob.glob(os.path.join(ROOT, "prompts", "*caption*.txt"))):
-        for i, line in enumerate(open(p, encoding="utf-8")):
-            if line.strip():
-                out.append((f"{os.path.basename(p)}:{i} {line.strip()[:60]}", line.strip()))
-    return out
 
 
 def restore():
     """Re-open the last song without redoing the demux."""
     if os.path.exists(STATE_FILE):
         base = json.load(open(STATE_FILE, encoding="utf-8")).get("base")
-        if base and os.path.exists(os.path.join(os.path.dirname(base), "orig", "full.wav")):
-            root = os.path.dirname(os.path.abspath(base))
-            state.update(base=base, root=root, name=os.path.splitext(os.path.basename(base))[0],
-                         duration=sf.info(os.path.join(root, "orig", "full.wav")).duration)
+        if base and os.path.exists(os.path.join(song_root(base), "orig", "full.wav")):
+            set_song(base)
 
 
+MAP_HEADERS = ["такт", "час", "акорд 1-ї половини", "акорд 2-ї половини", "енергія 0-2"]
+FLATS = {"Db": "C#", "Eb": "D#", "Gb": "F#", "Ab": "G#", "Bb": "A#"}
+
+
+def parse_chord(text):
+    """Root pitch class from 'A', 'c#', 'Bb'…"""
+    t = str(text).strip().replace("♯", "#").replace("♭", "b").capitalize()
+    t = FLATS.get(t, t)
+    if t not in native_bank.NOTES:
+        raise gr.Error(f"Невідомий акорд «{text}»: потрібна нота на кшталт A, C#, Bb.")
+    return native_bank.NOTES.index(t)
+
+
+def map_rows():
+    """Rows of the song map (automatic guess + the user's corrections), [] without a song."""
+    if not state["root"]:
+        return []
+    song = native_arrange.song_with_edits(state["root"])
+    g, notes = song["grid"], native_bank.NOTES
+    rows = []
+    for b, lv in enumerate(song["level"]):
+        t = g["bar0"] + b * g["bar"]
+        rows.append([b, f"{int(t // 60)}:{t % 60:04.1f}", notes[song["roots"][2 * b]], notes[song["roots"][2 * b + 1]], lv])
+    return rows
+
+
+@friendly
+def show_map(progress=gr.Progress()):
+    """What the arranger took from the song (grid, chords, energy per bar), shown so that a wrong guess is visible."""
+    need_song()
+    progress(0.1, desc="Аналіз пісні…")
+    song = native_arrange.analyse(state["root"])
+    g = song["grid"]
+    n_edit = sum(map(len, native_arrange.load_edits(state["root"]).values()))
+    return (f"**Сітка:** {g['bpm']:.2f} BPM (збіг барабанів із сіткою {100 * g['coherence']:.0f}%), {song['n_bars']} тактів. "
+            f"Виправлень користувача: {n_edit}.  \nГітари грають на коренях акордів із таблиці, малюнок залежить від енергії такту.",
+            map_rows())
+
+
+@friendly
+def save_map(rows):
+    """Store the cells that differ from the automatic guess; they are applied to every later render."""
+    need_song()
+    auto = native_arrange.analyse(state["root"])
+    edits = {"roots": {}, "levels": {}}
+    for r in rows:
+        if r[0] in ("", None):
+            continue
+        b = int(r[0])
+        for k, cell in ((2 * b, r[2]), (2 * b + 1, r[3])):
+            pc = parse_chord(cell)
+            if pc != auto["roots"][k]:
+                edits["roots"][str(k)] = pc
+        lv = int(float(r[4]))
+        if lv not in (0, 1, 2):
+            raise gr.Error(f"Такт {b}: енергія має бути 0, 1 або 2.")
+        if lv != auto["level"][b]:
+            edits["levels"][str(b)] = lv
+    native_arrange.save_edits(state["root"], edits)
+    gr.Info(f"Збережено виправлень: акордів {len(edits['roots'])}, тактів {len(edits['levels'])}.")
+    return show_map.__wrapped__()
+
+
+@friendly
+def reset_map():
+    need_song()
+    if os.path.exists(native_arrange.edits_path(state["root"])):
+        os.remove(native_arrange.edits_path(state["root"]))
+    return show_map.__wrapped__()
+
+
+@friendly
+def map_select(evt: gr.SelectData):
+    """A click on a row of the map puts the start of the fragment on that bar."""
+    if not state["root"]:
+        return gr.update()
+    g = native_arrange.analyse(state["root"])["grid"]
+    return gr.update(value=int(g["bar0"] + evt.index[0] * g["bar"]))
+
+
+# ----------------------------------------------------------------------------------------- references
+def slot_preview(name):
+    """Player copy of a whole reference (its original mix as a small OGG, made once)."""
+    src = os.path.join(ref_dir(name), "full.wav")
+    os.makedirs(PLAY_DIR, exist_ok=True)
+    out = os.path.join(PLAY_DIR, f"ref_{slug(state['root'])}_{name}.ogg")
+    if not os.path.exists(out) or os.path.getmtime(out) < os.path.getmtime(src):
+        y, sr = sf.read(src, dtype="float32", always_2d=True)
+        # writing a whole track in one call overflows the stack inside libsndfile's Vorbis encoder: write by seconds
+        with sf.SoundFile(out, "w", sr, y.shape[1], format="OGG", subtype="VORBIS") as f:
+            for i in range(0, len(y), sr):
+                f.write(y[i:i + sr])
+    return out
+
+
+@friendly
+def play_reference(name):
+    if not name:
+        return gr.update(), gr.update()
+    return to_player(slot_preview(name), f"Зразок «{name}»")
+
+
+def add_tracks(current, folder, progress):
+    """Split new reference tracks into stems (into the song's folder) and tick them."""
+    need_song()
+    if folder:
+        d = pick("Тека з треками-зразками", folder=True)
+        files = sorted(os.path.join(d, f) for f in os.listdir(d) if os.path.splitext(f)[1].lower() in AUDIO_EXT) if d else []
+    else:
+        f = pick("Оберіть трек-зразок")
+        files = [f] if f else []
+    if not files:
+        return gr.update(), gr.update(), bank_status()
+    added = list(current)
+    for i, f in enumerate(files):
+        progress(i / len(files), desc=f"Стеми {i + 1}/{len(files)}: {os.path.basename(f)} (~1–2 хв на трек)")
+        demux(f, ref_dir(slug(f)))
+        added.append(slug(f))
+    refs = reference_names()
+    return gr.update(choices=refs, value=sorted(set(added))), gr.update(choices=refs), bank_status()
+
+
+@friendly
+def add_one(current, progress=gr.Progress()):
+    return add_tracks(current, False, progress)
+
+
+@friendly
+def add_folder(current, progress=gr.Progress()):
+    return add_tracks(current, True, progress)
+
+
+# ----------------------------------------------------------------------------------------- bank
+@friendly
+def make_bank(selected, redo, progress=gr.Progress()):
+    need_song()
+    if not selected:
+        raise gr.Error("Відмітьте зразки, з яких нарізати банк.")
+    log = io.StringIO()
+    for i, name in enumerate(selected):
+        progress(i / len(selected), desc=f"Нарізання {i + 1}/{len(selected)}: {name}")
+        with contextlib.redirect_stdout(log):
+            native_bank.build(ref_dir(name), bank_dir(), redo)
+    tracks = bank_tracks()
+    best_d, best_g = native_arrange.best_tracks(state["root"])
+    return (gr.update(choices=bank_samples(), value=None), gr.update(choices=tracks, value=best_d),
+            gr.update(choices=tracks, value=best_g), gr.update(choices=tracks, value=None),
+            gr.update(choices=tracks, value=None), "```\n" + log.getvalue() + "\n```")
+
+
+@friendly
+def play_sample(path):
+    if not path or not os.path.exists(path):
+        return gr.update(), gr.update()
+    return to_player(path, os.path.relpath(path, bank_dir()))
+
+
+@friendly
+def delete_sample(path):
+    if not path or not os.path.exists(path):
+        gr.Warning("Спочатку оберіть семпл у списку: він і видалиться.")
+        return gr.update(), gr.update()
+    os.remove(path)
+    return gr.update(choices=bank_samples(), value=None), f"Видалено: {os.path.relpath(path, bank_dir())}"
+
+
+# ----------------------------------------------------------------------------------------- arrangement
+def fragment(start, length, whole):
+    """(start, length) in seconds for the arranger; length 0 = the whole song."""
+    return (0.0, 0.0) if whole else (float(start), float(length))
+
+
+def engine_opts(p0, p1, p2, human, max_shift, double, fills):
+    return dict(patterns={0: p0, 1: p1, 2: p2}, human=float(human), max_shift=int(max_shift), double=bool(double),
+                fills=bool(fills))
+
+
+@friendly
+def play_song(drum_track, guitar_track, start, length, whole, seed, vocals, bass, other, guitar, drums, crash, orig_drums,
+              *opts, progress=gr.Progress()):
+    need_song()
+    if not drum_track or not guitar_track:
+        raise gr.Error("Оберіть, з яких треків брати барабани й гітари (спершу нарізайте банк).")
+    progress(0.1, desc="Гра семплами…")
+    a, n = fragment(start, length, whole)
+    out, text = native_arrange.arrange(state["root"], [drum_track], a, n, int(seed), "", vocals, bass, other, guitar,
+                                       drums, crash, guitar_tracks=[guitar_track], orig_drums=orig_drums,
+                                       **engine_opts(*opts))
+    outs = outputs()
+    return (*to_player(out, os.path.basename(out)), gr.update(choices=outs, value=out), text)
+
+
+@friendly
+def compare(part, start, length, whole, seed, *opts_and_progress):
+    """The same fragment with every bank track in turn (drums or guitars only); the radio then plays them one click each."""
+    need_song()
+    *opts, progress = opts_and_progress
+    tracks = bank_tracks()
+    if not tracks:
+        raise gr.Error("Банк порожній: спершу «Нарізати банк».")
+    a, n = fragment(start, length, whole)
+    paths = {}
+    for i, t in enumerate(tracks):
+        progress(i / len(tracks), desc=f"{'Барабани' if part == 'drums' else 'Гітари'}: {t}")
+        paths.update(native_arrange.compare_tracks(state["root"], part, a, n or 20.0, int(seed), only=[t],
+                                                           **engine_opts(*opts)))
+    return gr.update(choices=list(paths), value=None), f"Готово: {len(paths)} варіантів, клік по треку грає його."
+
+
+@friendly
+def compare_drums(*a, progress=gr.Progress()):
+    return compare("drums", *a, progress)
+
+
+@friendly
+def compare_guitar(*a, progress=gr.Progress()):
+    return compare("guitar", *a, progress)
+
+
+@friendly
+def play_compared(part, track):
+    """A click on a track in the comparison: plays it and makes it the choice for the drums / the guitars."""
+    path = os.path.join(state["root"], "native", "compare", part, f"{track}.wav")
+    if not track or not os.path.exists(path):
+        return gr.update(), gr.update(), gr.update()
+    label = ("Барабани" if part == "drums" else "Гітари") + f" «{track}»"
+    return (*to_player(path, label), gr.update(value=track))
+
+
+@friendly
+def play_output(path):
+    if not path or not os.path.exists(path):
+        return gr.update(), gr.update()
+    return to_player(path, os.path.basename(path))
+
+
+# ----------------------------------------------------------------------------------------- UI
 def build():
     restore()
-    h0 = history()
-    with gr.Blocks(title="Реконструкція музики — тюнер") as demo:
-        gr.Markdown("**Як користуватись:** 1) оберіть пісню — вона сама розділиться на стеми; 2) за бажанням оберіть "
-                    "зразок звучання; 3) налаштуйте і натисніть «Згенерувати» у вкладці Lego або Cover; "
-                    "4) у блоці «Зведення» крутіть повзунки та слухайте — без нової генерації.")
+    refs0, tracks0, outs0 = reference_names(), bank_tracks(), outputs()
+    d0 = int(state["duration"])
+    with gr.Blocks(title="Реконструкція музики: гра реальними семплами") as demo:
+        gr.Markdown("**Як користуватись:** 1) пісня (поруч із нею з'явиться робоча тека); 2) треки-зразки: додайте, послухайте, "
+                    "відмітьте, з яких брати звук; 3) «Нарізати банк» — з їхніх барабанів і гітар виходять окремі семпли, "
+                    "послухайте їх і видаліть погані; 4) «Зіграти»: пісня переграється цими семплами, вокал і бас лишаються "
+                    "оригінальними. Нічого не генерується: весь звук — справжні записи зразків.")
         gr.Markdown("### 1. Пісня")
         with gr.Row():
-            base_path = gr.Textbox(state["base"] or "", label="Файл пісні", scale=4,
-                                   info="Повний шлях до треку або кнопка «Огляд…». Папка цього файлу стає кореневою "
-                                        "робочою папкою.")
+            base_path = gr.Textbox(state["base"] or "", label="Файл пісні", scale=5)
             base_browse = gr.Button("Огляд…", scale=1)
-            base_load = gr.Button("Завантажити пісню", variant="primary", scale=1)
+            base_load = gr.Button("Завантажити", variant="primary", scale=1)
         with gr.Row():
-            root_box = gr.Textbox(state["root"] or "—", label="Коренева папка", interactive=False, scale=4,
-                                  info="Тут лежать: готові результати (<назва>-<дата-час>.wav), підпапки orig, "
-                                       "reference і gen.")
-            open_btn = gr.Button("Відкрити папку", scale=1)
-        song_info = gr.Markdown(song_status())
+            root_box = gr.Textbox(state["root"] or "", label="Робоча тека (поруч із піснею, названа як вона)",
+                                  interactive=False, scale=5)
+            open_btn = gr.Button("Відкрити теку", scale=1)
+        with gr.Row():
+            analyse_btn = gr.Button("Що програма розуміє про пісню", scale=1)
+            analysis = gr.Markdown("Сітка й карта тактів (акорди та енергія); нижче її можна виправити.")
+        with gr.Accordion("Карта пісні: акорди й енергія по тактах (виправляйте хибне)", open=False):
+            gr.Markdown("Програма вгадала корінь акорду для кожної половини такту й «енергію» такту (0 тиха, 1 середня, 2 гучна): "
+                        "від неї залежать малюнок гітари й креш. Гітари грають рівно ці акорди, тож хибний корінь = фальш. "
+                        "Виправте клітинки (нота: A, C#, Bb…) і натисніть «Зберегти правки». Клік по рядку ставить початок "
+                        "фрагмента на цей такт.")
+            map_tbl = gr.Dataframe(map_rows(), headers=MAP_HEADERS, datatype=["number", "str", "str", "str", "number"],
+                                   interactive=True, column_count=(5, "fixed"), static_columns=[0, 1], type="array",
+                                   max_height=380)
+            with gr.Row():
+                map_save_btn = gr.Button("Зберегти правки", variant="primary")
+                map_reset_btn = gr.Button("Скинути правки до автоматичних")
 
+        gr.Markdown("### 2. Треки-зразки")
         with gr.Row():
-            with gr.Column():
-                gr.Markdown("### 2. Що чує модель (контекст)")
-                start = gr.Slider(0, int(state["duration"]), min(40, int(state["duration"])), step=1,
-                                  label="Початок фрагмента, с",
-                                  info="Яку частину пісні обробляти. Коротший фрагмент = швидша генерація "
-                                       "(60 с ≈ 7 с).")
-                end = gr.Slider(10, int(state["duration"]), min(100, int(state["duration"])), step=1,
-                                label="Кінець фрагмента, с")
-                g_voc = gr.Slider(0, 1.5, 1.0, step=0.05, label="Вокал у контексті",
-                                  info="Наскільки голосно модель «чує» вокал. 0 = не чує зовсім.")
-                g_drm = gr.Slider(0, 1.5, 1.0, step=0.05, label="Барабани у контексті",
-                                  info="Допомагає моделі триматися ритму пісні.")
-                g_bas = gr.Slider(0, 1.5, 1.0, step=0.05, label="Бас у контексті",
-                                  info="Допомагає моделі потрапляти в акорди пісні.")
-                g_oth = gr.Slider(0, 1.5, 0.0, step=0.05, label="Електроніка оригіналу у контексті",
-                                  info="0 = модель не чує оригінальні синтезатори й замінює їх своєю партією; "
-                                       "1 = дописує поверх них.")
-            with gr.Column():
-                gr.Markdown("### 3. Зразок звучання (необов'язково)")
-                use_ref = gr.Checkbox(True, label="Використати зразок",
-                                      info="Модель наслідує тембр і стиль зразка. Без нього стиль випадковий.")
-                ref_name = gr.Dropdown(reference_names(), value=(reference_names() or [None])[0], label="Зразок",
-                                       info="Список підготовлених зразків цієї пісні.")
-                ref_stems = gr.CheckboxGroup(REF_STEM_CHOICES, value=["other"], label="Що брати зі зразка",
-                                             info="Без вокалу — щоб слова зразка не потрапили у результат. Лише "
-                                                  "«інше» — брати тембр гітар/клавіш, а не все аранжування.")
-                ref_start = gr.Slider(0, 300, 0, step=1, label="Вікно зразка починається з, с",
-                                      info="Модель завжди бере рівно 30 с зразка. Оберіть місце, де грає потрібна "
-                                           "гітара.")
-                with gr.Row():
-                    ref_path = gr.Textbox(label="Новий зразок", scale=3, info="Шлях до файлу або «Огляд…».")
-                    ref_browse = gr.Button("Огляд…", scale=1)
-                ref_load = gr.Button("Завантажити зразок")
-                ref_status = gr.Markdown("")
-                ref_prev = gr.Audio(label="Зразок, який справді отримала модель", interactive=False)
-            with gr.Column():
-                gr.Markdown("### Спільні налаштування генерації")
-                model = gr.Dropdown(MODELS, value=MODELS[0], label="Модель",
-                                    info="base — потрібна для Lego. sft і turbo — для Cover (turbo швидша, 8 кроків).")
-                caption = gr.Textbox(lines=4, label="Опис звуку (англійською)",
-                                     value=(preset_choices() or [("", "")])[0][1],
-                                     info="Текстовий опис потрібного звучання. Впливає слабо: головне — зразок і сід.")
-                presets = gr.Dropdown(preset_choices(), label="Готові описи", info="Підставити опис з prompts/.")
-                steps = gr.Slider(8, 100, 50, step=1, label="Кроки",
-                                  info="Більше = детальніше, але повільніше. base/sft: ~50, turbo: 8.")
-                guidance = gr.Slider(1, 15, 7, step=0.5, label="Guidance",
-                                     info="Наскільки суворо модель слідує опису. Вище = слухняніше, але жорсткіший звук.")
-                seed = gr.Number(0, precision=0, label="Сід",
-                                 info="Число, що задає випадковість. Той самий сід і налаштування = той самий результат.")
-                count = gr.Slider(1, 6, 1, step=1, label="Скільки варіантів",
-                                  info="Зробити поспіль кілька варіантів: сід, сід+1, сід+2…")
-        common = [model, caption, steps, guidance, seed, count, start, end, g_voc, g_drm, g_bas, g_oth,
-                  use_ref, ref_name, ref_stems, ref_start]
-        with gr.Tabs():
-            with gr.Tab("Lego — дописати нову партію"):
-                gr.Markdown("Модель дописує **нову доріжку** (напр. гітару) до того, що вона чує в контексті. "
-                            "Повертається лише ця доріжка, барабани/бас/вокал додаються у зведенні.")
-                track = gr.Dropdown(TRACKS, value="guitar", label="Яку партію дописати",
-                                    info="Наприклад guitar — гітара.")
-                rep_start = gr.Slider(0, 300, 0, step=1, label="Генерувати від, с",
-                                      info="Нову партію лише на відрізку фрагмента. 0 і −1 = на весь фрагмент.")
-                rep_end = gr.Slider(-1, 300, -1, step=1, label="Генерувати до, с (−1 = до кінця)")
-                lego_btn = gr.Button("Згенерувати (Lego)", variant="primary")
-            with gr.Tab("Cover — переграти те, що чує модель"):
-                gr.Markdown("Модель **переграє** весь контекст у новому звучанні. Увага: велика сила джерела дає "
-                            "майже копію оригіналу.")
-                noise = gr.Slider(0, 1, 0.5, step=0.05, label="Шум джерела",
-                                  info="0 = модель губить тональність і ритм; 0.4–0.6 = тримає їх.")
-                strength = gr.Slider(0, 1, 0.7, step=0.05, label="Сила джерела",
-                                     info="1.0 = результат майже повторює вхід; менше = модель вільніша.")
-                cover_btn = gr.Button("Згенерувати (Cover)", variant="primary")
-        status = gr.Markdown("")
-        gen_audio = gr.Audio(label="Згенерована доріжка (окремо, без барабанів і вокалу)", interactive=False)
+            add_btn = gr.Button("＋ Додати трек…", scale=1)
+            add_dir_btn = gr.Button("＋ Додати всі треки з теки…", scale=1)
+        refs = gr.CheckboxGroup(refs0, value=refs0, label="Нарізати банк із",
+                                info="Кожен трек розділяється на стеми один раз (~1–2 хв).")
+        with gr.Row():
+            listen_ref = gr.Dropdown(refs0, label="Послухати зразок цілим", scale=4)
+            stop_btn = gr.Button("⏹ Стоп", scale=1, min_width=80)
 
-        gr.Markdown("### 4. Зведення (миттєво, без нової генерації)")
+        gr.Markdown("### 3. Банк семплів")
         with gr.Row():
-            ga = gr.Dropdown(h0, value=h0[0][1] if h0 else None, label="Гітара A",
-                             info="Одна з згенерованих доріжок (нові зверху).")
-            gb = gr.Dropdown(h0, value=h0[1][1] if len(h0) > 1 else None, label="Гітара B (необов'язково)",
-                             info="Друга доріжка: разом з A дає дві різні гітари.")
+            bank_btn = gr.Button("Нарізати банк із відмічених", variant="primary", scale=2)
+            redo = gr.Checkbox(False, label="Нарізати наново", info="Інакше вже нарізані треки пропускаються.", scale=1)
+            bank_open = gr.Button("Відкрити теку банку", scale=1)
+        bank_msg = gr.Markdown(bank_status())
         with gr.Row():
-            m_voc = gr.Slider(0, 2, 1.0, step=0.05, label="Вокал оригіналу", info="Чистий вокал із оригіналу.")
-            m_drm = gr.Slider(0, 2, 1.0, step=0.05, label="Барабани оригіналу")
-            m_bas = gr.Slider(0, 2, 1.0, step=0.05, label="Бас оригіналу")
-            m_oth = gr.Slider(0, 2, 0.0, step=0.05, label="Електроніка оригіналу",
-                              info="0 = прибрана (замінена гітарами).")
-        with gr.Row():
-            m_a = gr.Slider(0, 2, 1.0, step=0.05, label="Рівень гітари A")
-            p_a = gr.Slider(-1, 1, 0.0, step=0.1, label="Панорама A", info="−1 ліворуч, 1 праворуч, 0 = як згенеровано.")
-            m_b = gr.Slider(0, 2, 0.0, step=0.05, label="Рівень гітари B", info="0 = B вимкнено.")
-            p_b = gr.Slider(-1, 1, 0.0, step=0.1, label="Панорама B")
-            master = gr.Slider(0.2, 2, 1.0, step=0.05, label="Загальна гучність")
-        mix_btn = gr.Button("Змішати", variant="primary")
-        mix_audio = gr.Audio(label="Результат", interactive=False)
-        mix_status = gr.Markdown("")
+            sample = gr.Dropdown(bank_samples(), label="Семпл банку (клік грає)", scale=5,
+                                 info="Барабани: kick, snare, hat, crash; гітари: акорд-«квінта» від ноти, довжина "
+                                      "short/mid/long.")
+            sample_del = gr.Button("Видалити семпл", scale=1)
+        bank_now = gr.Markdown("")
+        bank_player = gr.Audio(show_label=False, interactive=False, autoplay=True)
 
-        mix_in = [ga, gb, m_voc, m_drm, m_bas, m_oth, m_a, m_b, p_a, p_b, master]
-        song_out = [root_box, song_info, start, end, ref_name, ga, gb]
-        gen_out = [gen_audio, ga, gb, ref_prev, status]
+        gr.Markdown("### 4. Зіграти пісню")
+        gr.Markdown("**Не змішуйте треки.** Барабани беруться з одного треку, гітари з одного: суміш різних комплектів "
+                    "звучить кашею. Порівняйте треки на одному фрагменті (кнопки нижче), клік по треку в списку грає його й "
+                    "одразу вибирає. Тоді «Зіграти».")
+        with gr.Row():
+            start = gr.Slider(0, d0, min(40, max(d0 - 20, 0)), step=1, label="Початок фрагмента, с")
+            length = gr.Slider(5, 60, 20, step=1, label="Довжина фрагмента, с", info="Короткий фрагмент рахується за секунди.")
+            whole = gr.Checkbox(False, label="Вся пісня", info="Ігнорує початок і довжину.")
+            seed = gr.Number(1, precision=0, label="Сід",
+                             info="Інший сід = інший вибір семплів і «людський» таймінг; решта однакова.")
+        with gr.Row():
+            cmp_drums_btn = gr.Button("Порівняти барабани всіх треків")
+            cmp_guitar_btn = gr.Button("Порівняти гітари всіх треків")
+        with gr.Row():
+            cmp_drums = gr.Radio(tracks0, label="Барабани (з оригінальними вокалом і басом)", value=None)
+            cmp_guitar = gr.Radio(tracks0, label="Гітари (з оригінальними вокалом, басом і барабанами)", value=None)
+        cmp_msg = gr.Markdown("")
+        best0 = native_arrange.best_tracks(state["root"]) if tracks0 else (None, None)
+        with gr.Row():
+            drum_track = gr.Dropdown(tracks0, value=best0[0], label="Барабани з",
+                                     info="Спершу обрано найповніше оснащений трек: це лише початок, вирішує слух.")
+            guitar_track = gr.Dropdown(tracks0, value=best0[1], label="Гітари з")
+        gr.Markdown("Малюнок гітари за енергією такту (див. карту пісні):")
+        pattern_choices = [(label, key) for key, (label, _, _) in native_arrange.PATTERN_LIBRARY.items()]
+        with gr.Row():
+            p_quiet = gr.Dropdown(pattern_choices, value=native_arrange.DEFAULT_PATTERNS[0], label="У тихих тактах (0)")
+            p_mid = gr.Dropdown(pattern_choices, value=native_arrange.DEFAULT_PATTERNS[1], label="У середніх тактах (1)")
+            p_loud = gr.Dropdown(pattern_choices, value=native_arrange.DEFAULT_PATTERNS[2], label="У гучних тактах (2)")
+        with gr.Accordion("Додатково", open=False):
+            with gr.Row():
+                human = gr.Slider(0, 3, 1.0, step=0.1, label="«Людськість» таймінгу",
+                                  info="0 = точно по сітці, як машина; 1 = типово; більше = недбаліше.")
+                max_shift = gr.Slider(0, 6, 3, step=1, label="Найбільший зсув семпла гітари, півтонів",
+                                      info="Менше = природніший тембр, але потрібні семпли поруч за висотою.")
+                orig_drums = gr.Slider(0, 1.5, 0.0, step=0.05, label="Оригінальні барабани",
+                                       info="0 = замінені семплами; можна лишити частково для склейки.")
+            with gr.Row():
+                double = gr.Checkbox(True, label="Дві гітари (дубль у панорамі)", info="Вимкнено = одна по центру.")
+                fills = gr.Checkbox(False, label="Філи", info="Перед гучнішим тактом остання доля стає снейр-роллом.")
+        with gr.Accordion("Рівні", open=False):
+            with gr.Row():
+                g_voc = gr.Slider(0, 2, 1.0, step=0.05, label="Вокал оригіналу")
+                g_bas = gr.Slider(0, 2, 1.0, step=0.05, label="Бас оригіналу")
+                g_oth = gr.Slider(0, 2, 0.0, step=0.05, label="Електроніка оригіналу",
+                                  info="0 = прибрана: її місце займають гітари.")
+            with gr.Row():
+                g_gtr = gr.Slider(0, 2, 1.0, step=0.05, label="Гітари", info="1 = типовий баланс до вокалу.")
+                g_drm = gr.Slider(0, 2, 1.0, step=0.05, label="Барабани", info="Оригінальні барабани замінено завжди.")
+                crash = gr.Checkbox(True, label="Креш на початку гучнішого розділу")
+        play_btn = gr.Button("Зіграти", variant="primary")
+        summary = gr.Markdown("")
+        out_now = gr.Markdown("")
+        out_player = gr.Audio(show_label=False, interactive=False, autoplay=True)
+        history = gr.Dropdown(outs0, value=outs0[0][1] if outs0 else None, label="Попередні результати (нові зверху)")
+
+        song_out = [root_box, map_tbl, start, refs, listen_ref, drum_track, guitar_track, cmp_drums, cmp_guitar, sample, history,
+                    bank_msg]
+        opts = [p_quiet, p_mid, p_loud, human, max_shift, double, fills]
+        play_in = [drum_track, guitar_track, start, length, whole, seed, g_voc, g_bas, g_oth, g_gtr, g_drm, crash,
+                   orig_drums, *opts]
+        cmp_in = [start, length, whole, seed, *opts]
         base_browse.click(lambda: browse("Оберіть пісню"), None, base_path)
         base_load.click(load_song, base_path, song_out)
         open_btn.click(open_root)
-        ref_browse.click(lambda: browse("Оберіть зразок"), None, ref_path)
-        ref_load.click(load_reference, ref_path, [ref_name, ref_status])
-        presets.change(lambda v: v, presets, caption)
-        lego_btn.click(gen_lego, common + [track, rep_start, rep_end], gen_out).then(mix, mix_in, [mix_audio, mix_status])
-        cover_btn.click(gen_cover, common + [noise, strength], gen_out).then(mix, mix_in, [mix_audio, mix_status])
-        mix_btn.click(mix, mix_in, [mix_audio, mix_status])
+        analyse_btn.click(show_map, None, [analysis, map_tbl])
+        map_save_btn.click(save_map, map_tbl, [analysis, map_tbl])
+        map_reset_btn.click(reset_map, None, [analysis, map_tbl])
+        map_tbl.select(map_select, None, start)
+        add_btn.click(add_one, refs, [refs, listen_ref, bank_msg])
+        add_dir_btn.click(add_folder, refs, [refs, listen_ref, bank_msg])
+        listen_ref.input(play_reference, listen_ref, [bank_player, bank_now])
+        stop_btn.click(None, None, None, js=STOP_JS)
+        bank_btn.click(make_bank, [refs, redo], [sample, drum_track, guitar_track, cmp_drums, cmp_guitar, bank_msg])
+        bank_open.click(open_bank)
+        sample.input(play_sample, sample, [bank_player, bank_now])
+        sample_del.click(delete_sample, sample, [sample, bank_now])
+        cmp_drums_btn.click(compare_drums, cmp_in, [cmp_drums, cmp_msg])
+        cmp_guitar_btn.click(compare_guitar, cmp_in, [cmp_guitar, cmp_msg])
+        cmp_drums.input(lambda t: play_compared("drums", t), cmp_drums, [out_player, out_now, drum_track])
+        cmp_guitar.input(lambda t: play_compared("guitar", t), cmp_guitar, [out_player, out_now, guitar_track])
+        play_btn.click(play_song, play_in, [out_player, out_now, history, summary])
+        history.input(play_output, history, [out_player, out_now])
     return demo
 
 
@@ -514,4 +620,5 @@ if __name__ == "__main__":
     ap.add_argument("--port", type=int, default=7860)
     ap.add_argument("--no-browser", action="store_true")
     a = ap.parse_args()
-    build().queue().launch(server_name="127.0.0.1", server_port=a.port, inbrowser=not a.no_browser, show_error=True)
+    build().queue().launch(server_name="127.0.0.1", server_port=a.port, inbrowser=not a.no_browser, show_error=True,
+                           head=HEAD)

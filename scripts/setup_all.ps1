@@ -3,6 +3,7 @@
 #   --full    also install the MusicGen stack (audiocraft, xformers, spacy...) via setup_main.ps1; only reconstruct.py
 #             needs it, the UI does not
 #   --check   only report what is installed / missing, change nothing
+#   --main-only  only the main environment + demucs weights (~8 GB): enough for check-tracks / stems, no ACE-Step
 #   --models  ACE-Step DiT checkpoints to download (default: base for Lego + turbo for Cover)
 # Needs: Python 3.10-3.12 and git in PATH, an NVIDIA driver, internet. Everything heavy goes to MODELS_DIR.
 param(
@@ -15,6 +16,7 @@ $ErrorActionPreference = 'Stop'
 $Extra = @($Extra)
 $checkOnly = $Extra -contains '--check'
 $full = $Extra -contains '--full'
+$mainOnly = $Extra -contains '--main-only'
 $models = @('acestep-v15-base', 'acestep-v15-turbo')
 $i = [array]::IndexOf($Extra, '--models')
 if ($i -ge 0 -and $Extra.Count -gt $i + 1) { $models = $Extra[$i + 1] -split ',' }
@@ -89,6 +91,17 @@ if ($full) {
     & "$PSScriptRoot\setup_main.ps1"
 }
 
+function Install-DemucsWeights {
+    Invoke-Checked $MainPython @('-c', "from demucs.pretrained import get_model; get_model('htdemucs_ft'); get_model('htdemucs'); print('demucs ok')")
+}
+if ($mainOnly) {
+    Write-Host '=== demucs weights ==='
+    Install-DemucsWeights
+    Show-Status
+    Write-Host "`nMain environment ready: run.bat check-tracks <folder> --demux. For the rest: run.bat setup-all"
+    return
+}
+
 Write-Host '=== 2/5 uv ==='
 if (-not (Get-Command uv -ErrorAction SilentlyContinue)) { Invoke-Checked $MainPython @('-m', 'pip', 'install', 'uv') }
 
@@ -108,7 +121,7 @@ for m in '$($models -join ',')'.split(','):
 Invoke-Checked $AceStepPython @('-c', $code)
 
 Write-Host '=== 5/5 demucs weights ==='
-Invoke-Checked $MainPython @('-c', "from demucs.pretrained import get_model; get_model('htdemucs_ft'); get_model('htdemucs'); print('demucs ok')")
+Install-DemucsWeights
 
 Show-Status
 Write-Host "`nReady. Start the UI with: run.bat ui"

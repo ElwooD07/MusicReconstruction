@@ -1,4 +1,4 @@
-"""Per-bar map of the song: grid, key, vocal activity/long notes, guitar (other) activity, drums.
+"""Per-bar map of the song: grid (native_song.fit_grid), key, vocal activity/long notes, guitar (other) activity, drums.
 
 Usage (main env):
     python tools/analyze_structure.py <song-root-folder> [--out <root>/orig/bars.json]
@@ -12,6 +12,9 @@ import os
 import librosa
 import numpy as np
 import soundfile as sf
+
+from native_bank import load as load44
+from native_song import fit_grid
 
 SR = 22050
 MIN_NOTE_S = 0.4
@@ -48,26 +51,12 @@ def main():
     drums, other, bass = (load(os.path.join(stems, f"{n}.wav")) for n in ("drums", "other", "bass"))
     voc = load(os.path.join(stems, "vocals.wav"))
 
-    tempo, beats = librosa.beat.beat_track(y=drums, sr=SR, units="time", start_bpm=144)
-    tempo = float(np.atleast_1d(tempo)[0])
-    ibi = np.diff(beats)
-    print(f"tempo {tempo:.1f} BPM; beats {len(beats)}, IBI median {np.median(ibi) * 1000:.0f} ms, "
-          f"std {ibi.std() * 1000:.0f} ms (a constant grid has a small std)")
-    beat = 60.0 / tempo
-    # downbeat phase: the beat offset (0..3) whose beats carry the most low-frequency (kick/bass) energy
-    low = librosa.feature.rms(y=bass, hop_length=512)[0]
-    t_low = librosa.frames_to_time(np.arange(len(low)), sr=SR, hop_length=512)
-    t0 = beats[0] % (4 * beat)
-    best = None
-    for k in range(4):
-        starts = np.arange(t0 + k * beat, len(drums) / SR, 4 * beat)
-        v = np.mean([low[np.searchsorted(t_low, s)] for s in starts if np.searchsorted(t_low, s) < len(low)])
-        if best is None or v > best[0]:
-            best = (v, t0 + k * beat)
-    grid0 = best[1] % (4 * beat)
-    bar = 4 * beat
+    # the grid comes from native_song.fit_grid (44.1 kHz): a beat tracker is a few percent off on programmed music
+    grid = fit_grid(*(load44(os.path.join(stems, f"{n}.wav")).mean(1) for n in ("drums", "bass", "other")))
+    tempo, bar, grid0 = grid["bpm"], grid["bar"], grid["bar0"]
     n_bars = int((len(drums) / SR - grid0) // bar)
-    print(f"bar = {bar:.3f} s, first downbeat {grid0:.2f} s, {n_bars} bars")
+    print(f"tempo {tempo:.2f} BPM (sixteenth grid fits {100 * grid['coherence']:.0f}% of the drum hits), "
+          f"bar = {bar:.3f} s, first downbeat {grid0:.2f} s, {n_bars} bars")
 
     f0, voiced, _ = librosa.pyin(voc, fmin=80, fmax=800, sr=SR, frame_length=2048, hop_length=512)
     hop_s = 512 / SR

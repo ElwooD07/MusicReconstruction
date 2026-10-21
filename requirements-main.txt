@@ -1,4 +1,4 @@
-# Lean packages of the main env (./env) for the UI workflow: demucs stems + metrics. Installed by `run.bat setup-all`
+# Lean packages of the main env (./env): demucs stems, the sample-bank tools (route B), the UI, metrics. Installed by `run.bat setup-all`
 # after torch/torchaudio (CUDA 12.6 wheels). Versions are the ones this project was developed with.
 demucs==4.1.0
 av==18.1.0
@@ -6,5 +6,6 @@ librosa==0.11.0
 soundfile==0.14.0
 scipy
 numpy
+gradio==6.30.0
 # optional (experiments/ast_tags.py, the AudioSet tagger): transformers==5.20.1
 # not needed here: audiocraft (only reconstruct.py / experiments/musicgen_guitar.py; use `run.bat setup` for those)
