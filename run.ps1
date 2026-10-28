@@ -6,6 +6,7 @@
 #   run.ps1 setup-all [--check] [--models a,b]   everything a new machine needs (+ health check)
 #   run.ps1 ui [--port 7860] [--no-browser]   tuning UI: sliders + instant listening
 #   run.ps1 check-tracks <folder> [--demux]   check a pack of reference tracks (+ split them into stems)
+#   run.ps1 i18n update|check|new <lang>      UI translations (locales\<lang>.json), Qt style
 #   run.ps1 native-bank <song-root>/reference [--redo]   slice reference stems into a bank of real samples (route B)
 #   run.ps1 native-arrange <song-root> [--tracks a,b] [--start S --length L] [--seed N]   replay the song with them
 #   run.ps1 pack-data --dest <folder> [--song <folder>] [--tracks <folder>] [--weights]   data for another machine
@@ -22,6 +23,7 @@ $commands = @{
     'pack-data'     = 'pack_data.ps1'
     'native-bank'   = 'native_bank.ps1'
     'native-arrange' = 'native_arrange.ps1'
+    'i18n'          = 'i18n.ps1'
 }
 
 $rest = $args

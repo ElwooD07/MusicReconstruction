@@ -30,24 +30,32 @@ import numpy as np
 import soundfile as sf
 
 import native_song as ns
-from native_bank import NOTES, SR, load
+from native_bank import NOTES, SR, bass_notes, load
 
 ANALYSIS_VERSION = 3
+
+
+def tr_noop(text):
+    """Marks a UI-visible string for the translation extractor (i18n.py); returns it unchanged. The UI translates it."""
+    return text
+
+
 MAX_SHIFT = 3                                       # semitones
+MAX_BASS_SHIFT = 5                                  # semitones, for bass notes (few samples per octave)
 LAYERS = ((1.0, 0.3, 0.0), (0.3, 1.0, 0.007))       # (left gain, right gain, delay s) of the two double-tracked layers
 # Guitar patterns: id -> (label, [(step in the bar, kind)], lock to the kick). Kinds: m = palm-muted chop, o = open
 # chord, a = accent. With the lock, chops are added wherever the song's kick falls between the listed steps.
 EIGHTHS = [(0, "o")] + [(s, "m") for s in range(2, 16, 2)] + [(15, "m")]
 PATTERN_LIBRARY = {
-    "none": ("без гітари", [], False),
-    "one": ("один відкритий акорд на «раз»", [(0, "o")], False),
-    "long": ("довгі акорди: «раз» і «три»", [(0, "o"), (8, "o")], False),
-    "quarters": ("відкриті акорди на чвертях", [(0, "o"), (4, "o"), (8, "o"), (12, "o")], False),
-    "sync": ("відкриті чверті й синкопи", [(0, "o"), (4, "o"), (8, "o"), (10, "a"), (12, "o"), (14, "a")], False),
-    "eighths": ("приглушені вісімки", EIGHTHS, False),
-    "eighths_kick": ("приглушені вісімки + удари разом із кіком", EIGHTHS, True),
-    "sixteenths": ("приглушені шістнадцяті", [(0, "o")] + [(s, "m") for s in range(1, 16)], False),
-    "kick": ("лише разом із кіком", [(0, "o")], True),
+    "none": (tr_noop("no guitar"), [], False),
+    "one": (tr_noop("one open chord on the downbeat"), [(0, "o")], False),
+    "long": (tr_noop("long chords: beats 1 and 3"), [(0, "o"), (8, "o")], False),
+    "quarters": (tr_noop("open chords on the quarter notes"), [(0, "o"), (4, "o"), (8, "o"), (12, "o")], False),
+    "sync": (tr_noop("open quarter notes and syncopation"), [(0, "o"), (4, "o"), (8, "o"), (10, "a"), (12, "o"), (14, "a")], False),
+    "eighths": (tr_noop("palm-muted eighths"), EIGHTHS, False),
+    "eighths_kick": (tr_noop("palm-muted eighths + hits with the kick"), EIGHTHS, True),
+    "sixteenths": (tr_noop("palm-muted sixteenths"), [(0, "o")] + [(s, "m") for s in range(1, 16)], False),
+    "kick": (tr_noop("only with the kick"), [(0, "o")], True),
 }
 DEFAULT_PATTERNS = {0: "long", 1: "eighths_kick", 2: "sync"}      # by energy level of the bar: quiet / middle / loud
 LEVEL_GAIN = {0: 0.8, 1: 0.9, 2: 1.0}
@@ -151,16 +159,16 @@ def resolve(root, tracks, guitar_tracks):
 class Bank:
     """Samples of the chosen reference tracks: drums from `drum_tracks`, guitar slices from `guitar_tracks`."""
 
-    def __init__(self, root, drum_tracks, guitar_tracks):
+    def __init__(self, root, drum_tracks, guitar_tracks, bass_tracks=()):
         base = os.path.join(root, "native", "bank")
         have = bank_tracks(root)
-        missing = [n for n in {*drum_tracks, *guitar_tracks} if n not in have]
+        missing = [n for n in {*drum_tracks, *guitar_tracks, *bass_tracks} if n not in have]
         if missing or not have:
             sys.exit(f"Not in the bank {base}: {missing or 'everything'} (run tools/native_bank.py first)")
-        self.drums, self.guitar, self.cache, self.last = {}, [], {}, {}
+        self.drums, self.guitar, self.bass, self.cache, self.last = {}, [], [], {}, {}
         self.drum_names, self.guitar_names = drum_tracks, guitar_tracks
         self.max_shift = MAX_SHIFT
-        for n in sorted({*drum_tracks, *guitar_tracks}):
+        for n in sorted({*drum_tracks, *guitar_tracks, *bass_tracks}):
             for s in json.load(open(os.path.join(base, n, "index.json")))["samples"]:
                 path = os.path.join(base, n, s["file"])
                 if not os.path.exists(path):             # deleted by the user: not wanted
@@ -168,6 +176,9 @@ class Bank:
                 s = dict(s, path=path, track=n)
                 if s["kind"] == "guitar" and n in guitar_tracks:
                     self.guitar.append(s)
+                elif s["kind"] == "bass":
+                    if n in bass_tracks:
+                        self.bass.append(s)
                 elif s["kind"] != "guitar" and n in drum_tracks:
                     self.drums.setdefault(s["kind"], []).append(s)
 
@@ -175,7 +186,7 @@ class Bank:
         key = (s["path"], shift)
         if key not in self.cache:
             y, _ = sf.read(s["path"], dtype="float32", always_2d=True)
-            if s["kind"] == "guitar":
+            if s["kind"] in ("guitar", "bass"):
                 y = y.mean(1, keepdims=True)
             if shift:
                 ratio = 2 ** (shift / 12)
@@ -211,6 +222,21 @@ class Bank:
         s, shift = pool[rng.choice(len(pool), p=w / w.sum())]
         recent.append(s["path"])
         del recent[:-6]
+        return s, shift
+
+
+    def bassnote(self, midi, length, rng):
+        """A bass sample for the note: the nearest pitch within MAX_BASS_SHIFT, preferring the length class of the note."""
+        want = "short" if length < 0.22 else "mid" if length < 0.5 else "long"
+        pool = [(s, midi - s["midi"]) for s in self.bass if abs(midi - s["midi"]) <= MAX_BASS_SHIFT]
+        if not pool:
+            return None, 0
+        recent = self.last.setdefault("bass", [])
+        w = np.array([np.exp(-0.6 * abs(sh)) * (1.0 if s["len_class"] == want else 0.15) * (0.3 if s["path"] in recent else 1.0)
+                      for s, sh in pool])
+        s, shift = pool[rng.choice(len(pool), p=w / w.sum())]
+        recent.append(s["path"])
+        del recent[:-4]
         return s, shift
 
 
@@ -299,6 +325,37 @@ def render_guitars(song, bank, rng, n, t0=0.0, patterns=None, human=1.0, double=
     return buf
 
 
+def song_bass(root):
+    """Notes of the song's own (electronic) bass: [dict(t, length, midi, rms)]; cached in <root>/native/bass_notes.json."""
+    path = os.path.join(root, "native", "bass_notes.json")
+    src = os.path.join(root, "orig", "bass.wav")
+    if os.path.exists(path):
+        c = json.load(open(path))
+        if c.get("mtime") == os.path.getmtime(src):
+            return c["notes"]
+    notes = [n for n in bass_notes(stem(root, "bass").mean(1)) if n["voiced"] >= 0.5 and n["rms"] > 0.005]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    json.dump(dict(mtime=os.path.getmtime(src), notes=notes), open(path, "w"))
+    return notes
+
+
+def render_bass(notes, bank, rng, n, t0=0.0, human=1.0):
+    """Bass bus of n frames from t0: the song's own bass line (times, pitches, lengths) played with the bank's bass notes."""
+    buf = np.zeros((n, 2), dtype=np.float32)
+    top = np.percentile([x["rms"] for x in notes], 90) if notes else 1.0
+    for x in notes:
+        t = x["t"] - t0
+        if not -1.0 <= t <= n / SR + 0.2:
+            continue
+        sample, shift = bank.bassnote(x["midi"], x["length"], rng)
+        if sample is None:
+            continue
+        y, att = bank.audio(sample, shift)
+        gain = (0.55 + 0.45 * min(x["rms"] / top, 1.0)) * rng.uniform(0.95, 1.05)
+        place(buf, y, att, t + rng.normal(0, 0.003 * human), gain, int((min(x["length"], 1.5) + 0.03) * SR))
+    return buf
+
+
 def active_rms(y, frame=4096, floor=0.1):
     """RMS over the frames that are not near-silent (so that gaps do not decide the level)."""
     m = y.mean(1) if y.ndim > 1 else y
@@ -309,13 +366,15 @@ def active_rms(y, frame=4096, floor=0.1):
 
 def arrange(root, tracks=(), start=0.0, length=0.0, seed=1, tag="", vocals=1.0, bass=1.0, keep_other=0.0, guitar=1.0,
             drums=1.0, crash=True, out=None, guitar_tracks=(), orig_drums=0.0, parts=("drums", "guitar"),
-            patterns=None, human=1.0, max_shift=MAX_SHIFT, double=True, fills=False):
+            patterns=None, human=1.0, max_shift=MAX_SHIFT, double=True, fills=False, bass_ref=False, bass_tracks=()):
     """Render the song (or `length` seconds from `start`) with the bank sound; returns (path of the wav, summary text).
     `tracks` / `guitar_tracks`: bank tracks for the drums / the guitars (empty = the best one, ['all'] = pooled).
     `parts` can leave out the drums or the guitars; `orig_drums` keeps the song's own drums (to audition guitars alone).
     `patterns` {energy level: id from PATTERN_LIBRARY}; `human` scales the timing looseness (0 = machine-exact);
     `max_shift` is the largest pitch shift of a guitar slice in semitones; `double` = two guitar layers; `fills` =
-    snare roll before louder bars. The song map is the automatic one with the user's corrections (edits.json)."""
+    snare roll before louder bars. `bass_ref`: the song's own bass is dropped and its bass LINE (transcribed) is played
+    with bass notes of `bass_tracks` (empty = the guitar tracks). The song map is the automatic one with the user's
+    corrections (edits.json)."""
     root = os.path.abspath(root)
     song = song_with_edits(root)
     g = song["grid"]
@@ -323,13 +382,17 @@ def arrange(root, tracks=(), start=0.0, length=0.0, seed=1, tag="", vocals=1.0, 
     a = min(max(start, 0.0), max(total - 1.0, 0.0))
     z = min(a + length, total) if length else total
     drum_tracks, gtr_tracks = resolve(root, tracks, guitar_tracks)
-    bank = Bank(root, drum_tracks, gtr_tracks)
+    bass_names = (list(bass_tracks) or gtr_tracks) if bass_ref else []
+    bank = Bank(root, drum_tracks, gtr_tracks, bass_names)
     bank.max_shift = max_shift
     rng = np.random.default_rng(seed)
     voc, bass_stem, other, orig_d = (stem(root, n, a, z) for n in ("vocals", "bass", "other", "drums"))
     n = len(voc)
     v_rms = active_rms(voc)
-    mix = vocals * voc + bass * bass_stem + keep_other * other + orig_drums * orig_d
+    mix = vocals * voc + (0.0 if bass_ref else bass) * bass_stem + keep_other * other + orig_drums * orig_d
+    if bass_ref:
+        bass_bus = render_bass(song_bass(root), bank, rng, n, a, human)
+        mix += bass_bus * (bass * 0.8 * v_rms / active_rms(bass_bus))
     if "drums" in parts:
         drum_bus = render_drums(song, bank, rng, n, crash, a, human, fills)
         mix += drum_bus * (drums * v_rms / active_rms(drum_bus))
@@ -351,10 +414,11 @@ def arrange(root, tracks=(), start=0.0, length=0.0, seed=1, tag="", vocals=1.0, 
     lv = np.bincount(song["level"], minlength=3)
     drum_counts = {k: len(v) for k, v in bank.drums.items()}
     text = "\n".join([
-        f"Фрагмент {a:.0f}–{z:.0f} с ({'вся пісня' if z - a >= total - 1 else f'{z - a:.0f} с'}), сід {seed}.",
-        f"Барабани з: {', '.join(drum_tracks)} {drum_counts}.",
-        f"Гітари з: {', '.join(gtr_tracks)} ({len(bank.guitar)} зрізів).",
-        f"Сітка {g['bpm']:.2f} BPM, {song['n_bars']} тактів, енергія низька/середня/висока = {lv.tolist()}."])
+        f"Fragment {a:.0f}-{z:.0f} s ({'whole song' if z - a >= total - 1 else f'{z - a:.0f} s'}), seed {seed}.",
+        f"Drums from: {', '.join(drum_tracks)} {drum_counts}.",
+        f"Guitars from: {', '.join(gtr_tracks)} ({len(bank.guitar)} slices).",
+        *([f"Bass: the song's line, notes from {', '.join(bass_names)} ({len(bank.bass)} notes)."] if bass_ref else []),
+        f"Grid {g['bpm']:.2f} BPM, {song['n_bars']} bars, energy low/middle/high = {lv.tolist()}."])
     return out, text
 
 
@@ -385,6 +449,9 @@ def main():
     ap.add_argument("--tag", default="")
     ap.add_argument("--vocals", type=float, default=1.0)
     ap.add_argument("--bass", type=float, default=1.0)
+    ap.add_argument("--bass-ref", action="store_true",
+                    help="drop the song's electronic bass, play its bass line with the bank's bass notes")
+    ap.add_argument("--bass-tracks", default="", help="bank tracks for --bass-ref (default: the guitar tracks)")
     ap.add_argument("--keep-other", type=float, default=0.0)
     ap.add_argument("--guitar", type=float, default=1.0, help="guitar level relative to the default balance")
     ap.add_argument("--drums", type=float, default=1.0, help="drum level relative to the default balance")
@@ -407,7 +474,8 @@ def main():
     out, text = arrange(a.root, split(a.tracks), a.start, a.length, a.seed, a.tag, a.vocals, a.bass, a.keep_other,
                         a.guitar, a.drums, not a.no_crash, a.out, split(a.guitar_tracks),
                         patterns={0: a.pattern_quiet, 1: a.pattern_middle, 2: a.pattern_loud}, human=a.human,
-                        max_shift=a.max_shift, double=not a.single, fills=a.fills)
+                        max_shift=a.max_shift, double=not a.single, fills=a.fills, bass_ref=a.bass_ref,
+                        bass_tracks=split(a.bass_tracks))
     print(text)
     print(out)
 

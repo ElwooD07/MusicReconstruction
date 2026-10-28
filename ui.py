@@ -7,7 +7,7 @@ Working folder ("root") = a folder named after the song, next to it (<dir>/<song
 that already lies in a folder of its own name uses that folder). The song file itself is never moved or copied:
     <root>/orig/        all stems of the song (made automatically, once)
     <root>/reference/   all stems of every reference track (made automatically, once)
-    <root>/native/bank/ samples cut from the references: drums/*.wav, guitar/*.wav (listen, delete the bad ones)
+    <root>/native/bank/ samples cut from the references: drums/*.wav, guitar/*.wav, bass/*.wav (listen, delete the bad ones)
     <root>/native/out/  the arrangements
 The work itself is in tools/native_bank.py, tools/native_song.py, tools/native_arrange.py (also usable without the UI).
 """
@@ -30,8 +30,10 @@ import soundfile as sf
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
+import i18n  # noqa: E402
 import native_arrange  # noqa: E402
 import native_bank  # noqa: E402
+from i18n import tr  # noqa: E402
 
 UI_DIR = os.path.join(ROOT, "temp", "ui")        # scratch: player copies, the remembered song
 STATE_FILE = os.path.join(UI_DIR, "state.json")
@@ -100,7 +102,7 @@ def friendly(fn):
 
 def need_song():
     if not state["root"]:
-        raise gr.Error("Спочатку оберіть пісню.")
+        raise gr.Error(tr("Pick a song first."))
 
 
 def playable(path):
@@ -177,7 +179,13 @@ def bank_samples():
         for s in json.load(open(os.path.join(bank_dir(), t, "index.json"), encoding="utf-8"))["samples"]:
             p = os.path.join(bank_dir(), t, s["file"])
             if os.path.exists(p):
-                what = s["kind"] if s["kind"] != "guitar" else f"гітара {native_bank.NOTES[s['root']]} {s['len_class']}"
+                if s["kind"] == "guitar":
+                    what = tr("guitar {note} {length}", note=native_bank.NOTES[s["root"]], length=s["len_class"])
+                elif s["kind"] == "bass":
+                    what = tr("bass {note} {length}", note=f"{native_bank.NOTES[s['midi'] % 12]}{s['midi'] // 12 - 1}",
+                              length=s["len_class"])
+                else:
+                    what = s["kind"]
                 out.append((f"{t[:24]} · {what} · {os.path.basename(p)}", p))
     return out
 
@@ -207,7 +215,9 @@ def bank_status():
     if not state["root"]:
         return ""
     n_ref, n_bank = len(reference_names()), len(bank_tracks())
-    return f"Зразків зі стемами: {n_ref}; у банку: {n_bank}." if n_ref else "Зразків ще немає: додайте їх у блоці 2."
+    if not n_ref:
+        return tr("No references yet: add them in block 2.")
+    return tr("References with stems: {n_ref}; in the bank: {n_bank}.", n_ref=n_ref, n_bank=n_bank)
 
 
 def set_song(path):
@@ -221,8 +231,8 @@ def set_song(path):
 def load_song(path, progress=gr.Progress()):
     path = (path or "").strip().strip('"')
     if not os.path.isfile(path):
-        raise gr.Error("Файл пісні не знайдено. Натисніть «Огляд…» або вставте повний шлях.")
-    progress(0.1, desc="Розділення на стеми (один раз, ~1-2 хв)…")
+        raise gr.Error(tr("Song file not found. Press “Browse…” or paste the full path."))
+    progress(0.1, desc=tr("Splitting into stems (once, ~1-2 min)…"))
     demux(path, os.path.join(song_root(path), "orig"))
     set_song(path)
     return song_updates()
@@ -236,7 +246,10 @@ def restore():
             set_song(base)
 
 
-MAP_HEADERS = ["такт", "час", "акорд 1-ї половини", "акорд 2-ї половини", "енергія 0-2"]
+def map_headers():
+    return [tr("bar"), tr("time"), tr("chord, 1st half"), tr("chord, 2nd half"), tr("energy 0-2")]
+
+
 FLATS = {"Db": "C#", "Eb": "D#", "Gb": "F#", "Ab": "G#", "Bb": "A#"}
 
 
@@ -245,7 +258,7 @@ def parse_chord(text):
     t = str(text).strip().replace("♯", "#").replace("♭", "b").capitalize()
     t = FLATS.get(t, t)
     if t not in native_bank.NOTES:
-        raise gr.Error(f"Невідомий акорд «{text}»: потрібна нота на кшталт A, C#, Bb.")
+        raise gr.Error(tr("Unknown chord “{text}”: expected a note like A, C#, Bb.", text=text))
     return native_bank.NOTES.index(t)
 
 
@@ -266,12 +279,13 @@ def map_rows():
 def show_map(progress=gr.Progress()):
     """What the arranger took from the song (grid, chords, energy per bar), shown so that a wrong guess is visible."""
     need_song()
-    progress(0.1, desc="Аналіз пісні…")
+    progress(0.1, desc=tr("Analysing the song…"))
     song = native_arrange.analyse(state["root"])
     g = song["grid"]
     n_edit = sum(map(len, native_arrange.load_edits(state["root"]).values()))
-    return (f"**Сітка:** {g['bpm']:.2f} BPM (збіг барабанів із сіткою {100 * g['coherence']:.0f}%), {song['n_bars']} тактів. "
-            f"Виправлень користувача: {n_edit}.  \nГітари грають на коренях акордів із таблиці, малюнок залежить від енергії такту.",
+    return (tr("**Grid:** {bpm} BPM (the drums fit the grid {fit}%), {bars} bars. User corrections: {edits}.  \n"
+               "The guitars play the chord roots from the table; the pattern depends on the bar's energy.",
+               bpm=f"{g['bpm']:.2f}", fit=f"{100 * g['coherence']:.0f}", bars=song["n_bars"], edits=n_edit),
             map_rows())
 
 
@@ -291,11 +305,11 @@ def save_map(rows):
                 edits["roots"][str(k)] = pc
         lv = int(float(r[4]))
         if lv not in (0, 1, 2):
-            raise gr.Error(f"Такт {b}: енергія має бути 0, 1 або 2.")
+            raise gr.Error(tr("Bar {bar}: energy must be 0, 1 or 2.", bar=b))
         if lv != auto["level"][b]:
             edits["levels"][str(b)] = lv
     native_arrange.save_edits(state["root"], edits)
-    gr.Info(f"Збережено виправлень: акордів {len(edits['roots'])}, тактів {len(edits['levels'])}.")
+    gr.Info(tr("Corrections saved: {chords} chords, {bars} bars.", chords=len(edits["roots"]), bars=len(edits["levels"])))
     return show_map.__wrapped__()
 
 
@@ -335,23 +349,23 @@ def slot_preview(name):
 def play_reference(name):
     if not name:
         return gr.update(), gr.update()
-    return to_player(slot_preview(name), f"Зразок «{name}»")
+    return to_player(slot_preview(name), tr("Reference “{name}”", name=name))
 
 
 def add_tracks(current, folder, progress):
     """Split new reference tracks into stems (into the song's folder) and tick them."""
     need_song()
     if folder:
-        d = pick("Тека з треками-зразками", folder=True)
+        d = pick(tr("Folder with reference tracks"), folder=True)
         files = sorted(os.path.join(d, f) for f in os.listdir(d) if os.path.splitext(f)[1].lower() in AUDIO_EXT) if d else []
     else:
-        f = pick("Оберіть трек-зразок")
+        f = pick(tr("Pick a reference track"))
         files = [f] if f else []
     if not files:
         return gr.update(), gr.update(), bank_status()
     added = list(current)
     for i, f in enumerate(files):
-        progress(i / len(files), desc=f"Стеми {i + 1}/{len(files)}: {os.path.basename(f)} (~1–2 хв на трек)")
+        progress(i / len(files), desc=tr("Stems {i}/{n}: {name} (~1–2 min per track)", i=i + 1, n=len(files), name=os.path.basename(f)))
         demux(f, ref_dir(slug(f)))
         added.append(slug(f))
     refs = reference_names()
@@ -373,10 +387,10 @@ def add_folder(current, progress=gr.Progress()):
 def make_bank(selected, redo, progress=gr.Progress()):
     need_song()
     if not selected:
-        raise gr.Error("Відмітьте зразки, з яких нарізати банк.")
+        raise gr.Error(tr("Tick the references to cut the bank from."))
     log = io.StringIO()
     for i, name in enumerate(selected):
-        progress(i / len(selected), desc=f"Нарізання {i + 1}/{len(selected)}: {name}")
+        progress(i / len(selected), desc=tr("Cutting {i}/{n}: {name}", i=i + 1, n=len(selected), name=name))
         with contextlib.redirect_stdout(log):
             native_bank.build(ref_dir(name), bank_dir(), redo)
     tracks = bank_tracks()
@@ -396,10 +410,10 @@ def play_sample(path):
 @friendly
 def delete_sample(path):
     if not path or not os.path.exists(path):
-        gr.Warning("Спочатку оберіть семпл у списку: він і видалиться.")
+        gr.Warning(tr("Pick a sample in the list first: that one will be deleted."))
         return gr.update(), gr.update()
     os.remove(path)
-    return gr.update(choices=bank_samples(), value=None), f"Видалено: {os.path.relpath(path, bank_dir())}"
+    return gr.update(choices=bank_samples(), value=None), tr("Deleted: {path}", path=os.path.relpath(path, bank_dir()))
 
 
 # ----------------------------------------------------------------------------------------- arrangement
@@ -415,15 +429,15 @@ def engine_opts(p0, p1, p2, human, max_shift, double, fills):
 
 @friendly
 def play_song(drum_track, guitar_track, start, length, whole, seed, vocals, bass, other, guitar, drums, crash, orig_drums,
-              *opts, progress=gr.Progress()):
+              bass_ref, *opts, progress=gr.Progress()):
     need_song()
     if not drum_track or not guitar_track:
-        raise gr.Error("Оберіть, з яких треків брати барабани й гітари (спершу нарізайте банк).")
-    progress(0.1, desc="Гра семплами…")
+        raise gr.Error(tr("Pick which tracks supply the drums and the guitars (cut the bank first)."))
+    progress(0.1, desc=tr("Playing with samples…"))
     a, n = fragment(start, length, whole)
     out, text = native_arrange.arrange(state["root"], [drum_track], a, n, int(seed), "", vocals, bass, other, guitar,
                                        drums, crash, guitar_tracks=[guitar_track], orig_drums=orig_drums,
-                                       **engine_opts(*opts))
+                                       bass_ref=bool(bass_ref), **engine_opts(*opts))
     outs = outputs()
     return (*to_player(out, os.path.basename(out)), gr.update(choices=outs, value=out), text)
 
@@ -435,14 +449,14 @@ def compare(part, start, length, whole, seed, *opts_and_progress):
     *opts, progress = opts_and_progress
     tracks = bank_tracks()
     if not tracks:
-        raise gr.Error("Банк порожній: спершу «Нарізати банк».")
+        raise gr.Error(tr("The bank is empty: press “Cut the bank” first."))
     a, n = fragment(start, length, whole)
     paths = {}
     for i, t in enumerate(tracks):
-        progress(i / len(tracks), desc=f"{'Барабани' if part == 'drums' else 'Гітари'}: {t}")
+        progress(i / len(tracks), desc=f"{tr('Drums') if part == 'drums' else tr('Guitars')}: {t}")
         paths.update(native_arrange.compare_tracks(state["root"], part, a, n or 20.0, int(seed), only=[t],
                                                            **engine_opts(*opts)))
-    return gr.update(choices=list(paths), value=None), f"Готово: {len(paths)} варіантів, клік по треку грає його."
+    return gr.update(choices=list(paths), value=None), tr("Done: {n} variants, a click on a track plays it.", n=len(paths))
 
 
 @friendly
@@ -461,7 +475,7 @@ def play_compared(part, track):
     path = os.path.join(state["root"], "native", "compare", part, f"{track}.wav")
     if not track or not os.path.exists(path):
         return gr.update(), gr.update(), gr.update()
-    label = ("Барабани" if part == "drums" else "Гітари") + f" «{track}»"
+    label = (tr("Drums") if part == "drums" else tr("Guitars")) + f" “{track}”"
     return (*to_player(path, label), gr.update(value=track))
 
 
@@ -477,121 +491,126 @@ def build():
     restore()
     refs0, tracks0, outs0 = reference_names(), bank_tracks(), outputs()
     d0 = int(state["duration"])
-    with gr.Blocks(title="Реконструкція музики: гра реальними семплами") as demo:
-        gr.Markdown("**Як користуватись:** 1) пісня (поруч із нею з'явиться робоча тека); 2) треки-зразки: додайте, послухайте, "
-                    "відмітьте, з яких брати звук; 3) «Нарізати банк» — з їхніх барабанів і гітар виходять окремі семпли, "
-                    "послухайте їх і видаліть погані; 4) «Зіграти»: пісня переграється цими семплами, вокал і бас лишаються "
-                    "оригінальними. Нічого не генерується: весь звук — справжні записи зразків.")
-        gr.Markdown("### 1. Пісня")
+    with gr.Blocks(title=tr("Music reconstruction: replaying with real samples")) as demo:
+        gr.Markdown(tr("**How to use:** 1) the song (a working folder appears next to it); 2) reference tracks: add them, listen, "
+                       "tick the ones to take the sound from; 3) “Cut the bank from ticked”: their drums, guitars and bass are cut "
+                       "into separate samples, listen to them and delete the bad ones; 4) “Play”: the song is replayed with these "
+                       "samples, the vocals stay original. Nothing is generated: all the sound is real recordings of the references."))
+        gr.Markdown(tr("### 1. Song"))
         with gr.Row():
-            base_path = gr.Textbox(state["base"] or "", label="Файл пісні", scale=5)
-            base_browse = gr.Button("Огляд…", scale=1)
-            base_load = gr.Button("Завантажити", variant="primary", scale=1)
+            base_path = gr.Textbox(state["base"] or "", label=tr("Song file"), scale=5)
+            base_browse = gr.Button(tr("Browse…"), scale=1)
+            base_load = gr.Button(tr("Load"), variant="primary", scale=1)
         with gr.Row():
-            root_box = gr.Textbox(state["root"] or "", label="Робоча тека (поруч із піснею, названа як вона)",
+            root_box = gr.Textbox(state["root"] or "", label=tr("Working folder (next to the song, named after it)"),
                                   interactive=False, scale=5)
-            open_btn = gr.Button("Відкрити теку", scale=1)
+            open_btn = gr.Button(tr("Open folder"), scale=1)
         with gr.Row():
-            analyse_btn = gr.Button("Що програма розуміє про пісню", scale=1)
-            analysis = gr.Markdown("Сітка й карта тактів (акорди та енергія); нижче її можна виправити.")
-        with gr.Accordion("Карта пісні: акорди й енергія по тактах (виправляйте хибне)", open=False):
-            gr.Markdown("Програма вгадала корінь акорду для кожної половини такту й «енергію» такту (0 тиха, 1 середня, 2 гучна): "
-                        "від неї залежать малюнок гітари й креш. Гітари грають рівно ці акорди, тож хибний корінь = фальш. "
-                        "Виправте клітинки (нота: A, C#, Bb…) і натисніть «Зберегти правки». Клік по рядку ставить початок "
-                        "фрагмента на цей такт.")
-            map_tbl = gr.Dataframe(map_rows(), headers=MAP_HEADERS, datatype=["number", "str", "str", "str", "number"],
+            analyse_btn = gr.Button(tr("What the program understands about the song"), scale=1)
+            analysis = gr.Markdown(tr("Grid and bar map (chords and energy); correct it below."))
+        with gr.Accordion(tr("Song map: chords and energy per bar (correct what is wrong)"), open=False):
+            gr.Markdown(tr("The program guessed the chord root for every half bar and the bar's “energy” (0 quiet, 1 middle, 2 loud): "
+                           "the guitar pattern and the crash depend on it. The guitars play exactly these chords, so a wrong root = "
+                           "a wrong note. Fix the cells (a note: A, C#, Bb…) and press “Save corrections”. A click on a row puts "
+                           "the start of the fragment on that bar."))
+            map_tbl = gr.Dataframe(map_rows(), headers=map_headers(), datatype=["number", "str", "str", "str", "number"],
                                    interactive=True, column_count=(5, "fixed"), static_columns=[0, 1], type="array",
                                    max_height=380)
             with gr.Row():
-                map_save_btn = gr.Button("Зберегти правки", variant="primary")
-                map_reset_btn = gr.Button("Скинути правки до автоматичних")
+                map_save_btn = gr.Button(tr("Save corrections"), variant="primary")
+                map_reset_btn = gr.Button(tr("Reset corrections to automatic"))
 
-        gr.Markdown("### 2. Треки-зразки")
+        gr.Markdown(tr("### 2. Reference tracks"))
         with gr.Row():
-            add_btn = gr.Button("＋ Додати трек…", scale=1)
-            add_dir_btn = gr.Button("＋ Додати всі треки з теки…", scale=1)
-        refs = gr.CheckboxGroup(refs0, value=refs0, label="Нарізати банк із",
-                                info="Кожен трек розділяється на стеми один раз (~1–2 хв).")
+            add_btn = gr.Button(tr("＋ Add a track…"), scale=1)
+            add_dir_btn = gr.Button(tr("＋ Add all tracks from a folder…"), scale=1)
+        refs = gr.CheckboxGroup(refs0, value=refs0, label=tr("Cut the bank from"),
+                                info=tr("Each track is split into stems once (~1–2 min)."))
         with gr.Row():
-            listen_ref = gr.Dropdown(refs0, label="Послухати зразок цілим", scale=4)
-            stop_btn = gr.Button("⏹ Стоп", scale=1, min_width=80)
+            listen_ref = gr.Dropdown(refs0, label=tr("Listen to a whole reference"), scale=4)
+            stop_btn = gr.Button(tr("⏹ Stop"), scale=1, min_width=80)
 
-        gr.Markdown("### 3. Банк семплів")
+        gr.Markdown(tr("### 3. Sample bank"))
         with gr.Row():
-            bank_btn = gr.Button("Нарізати банк із відмічених", variant="primary", scale=2)
-            redo = gr.Checkbox(False, label="Нарізати наново", info="Інакше вже нарізані треки пропускаються.", scale=1)
-            bank_open = gr.Button("Відкрити теку банку", scale=1)
+            bank_btn = gr.Button(tr("Cut the bank from ticked"), variant="primary", scale=2)
+            redo = gr.Checkbox(False, label=tr("Re-cut"), info=tr("Otherwise the tracks already cut are skipped."), scale=1)
+            bank_open = gr.Button(tr("Open bank folder"), scale=1)
         bank_msg = gr.Markdown(bank_status())
         with gr.Row():
-            sample = gr.Dropdown(bank_samples(), label="Семпл банку (клік грає)", scale=5,
-                                 info="Барабани: kick, snare, hat, crash; гітари: акорд-«квінта» від ноти, довжина "
-                                      "short/mid/long.")
-            sample_del = gr.Button("Видалити семпл", scale=1)
+            sample = gr.Dropdown(bank_samples(), label=tr("Bank sample (a click plays it)"), scale=5,
+                                 info=tr("Drums: kick, snare, hat, crash; guitar: a fifth chord on a note; bass: a single note; "
+                                         "length short/mid/long."))
+            sample_del = gr.Button(tr("Delete sample"), scale=1)
         bank_now = gr.Markdown("")
         bank_player = gr.Audio(show_label=False, interactive=False, autoplay=True)
 
-        gr.Markdown("### 4. Зіграти пісню")
-        gr.Markdown("**Не змішуйте треки.** Барабани беруться з одного треку, гітари з одного: суміш різних комплектів "
-                    "звучить кашею. Порівняйте треки на одному фрагменті (кнопки нижче), клік по треку в списку грає його й "
-                    "одразу вибирає. Тоді «Зіграти».")
+        gr.Markdown(tr("### 4. Play the song"))
+        gr.Markdown(tr("**Do not mix tracks.** The drums come from one track, the guitars from one: a mix of different kits "
+                       "sounds like mush. Compare the tracks on one fragment (the buttons below), a click on a track in the list "
+                       "plays it and selects it. Then “Play”."))
         with gr.Row():
-            start = gr.Slider(0, d0, min(40, max(d0 - 20, 0)), step=1, label="Початок фрагмента, с")
-            length = gr.Slider(5, 60, 20, step=1, label="Довжина фрагмента, с", info="Короткий фрагмент рахується за секунди.")
-            whole = gr.Checkbox(False, label="Вся пісня", info="Ігнорує початок і довжину.")
-            seed = gr.Number(1, precision=0, label="Сід",
-                             info="Інший сід = інший вибір семплів і «людський» таймінг; решта однакова.")
+            start = gr.Slider(0, d0, min(40, max(d0 - 20, 0)), step=1, label=tr("Start of the fragment, s"))
+            length = gr.Slider(5, 60, 20, step=1, label=tr("Length of the fragment, s"), info=tr("A short fragment renders in seconds."))
+            whole = gr.Checkbox(False, label=tr("Whole song"), info=tr("Ignores the start and the length."))
+            seed = gr.Number(1, precision=0, label=tr("Seed"),
+                             info=tr("Another seed = another choice of samples and “human” timing; everything else is the same."))
         with gr.Row():
-            cmp_drums_btn = gr.Button("Порівняти барабани всіх треків")
-            cmp_guitar_btn = gr.Button("Порівняти гітари всіх треків")
+            cmp_drums_btn = gr.Button(tr("Compare the drums of all tracks"))
+            cmp_guitar_btn = gr.Button(tr("Compare the guitars of all tracks"))
         with gr.Row():
-            cmp_drums = gr.Radio(tracks0, label="Барабани (з оригінальними вокалом і басом)", value=None)
-            cmp_guitar = gr.Radio(tracks0, label="Гітари (з оригінальними вокалом, басом і барабанами)", value=None)
+            cmp_drums = gr.Radio(tracks0, label=tr("Drums (with the original vocals and bass)"), value=None)
+            cmp_guitar = gr.Radio(tracks0, label=tr("Guitars (with the original vocals, bass and drums)"), value=None)
         cmp_msg = gr.Markdown("")
         best0 = native_arrange.best_tracks(state["root"]) if tracks0 else (None, None)
         with gr.Row():
-            drum_track = gr.Dropdown(tracks0, value=best0[0], label="Барабани з",
-                                     info="Спершу обрано найповніше оснащений трек: це лише початок, вирішує слух.")
-            guitar_track = gr.Dropdown(tracks0, value=best0[1], label="Гітари з")
-        gr.Markdown("Малюнок гітари за енергією такту (див. карту пісні):")
-        pattern_choices = [(label, key) for key, (label, _, _) in native_arrange.PATTERN_LIBRARY.items()]
+            drum_track = gr.Dropdown(tracks0, value=best0[0], label=tr("Drums from"),
+                                     info=tr("The best equipped track is picked first: only a start, the ear decides."))
+            guitar_track = gr.Dropdown(tracks0, value=best0[1], label=tr("Guitars from"))
+        bass_ref = gr.Checkbox(False, label=tr("Bass from the bank (the song's line, the reference's sound)"),
+                               info=tr("The song's electronic bass is replaced: the same line of notes is played with the bass notes "
+                                       "of the “Guitars from” track. The level is “Original bass”. The first time the song's bass is "
+                                       "transcribed (~30 s), then it comes from the cache."))
+        gr.Markdown(tr("Guitar pattern by the bar's energy (see the song map):"))
+        pattern_choices = [(tr(label), key) for key, (label, _, _) in native_arrange.PATTERN_LIBRARY.items()]
         with gr.Row():
-            p_quiet = gr.Dropdown(pattern_choices, value=native_arrange.DEFAULT_PATTERNS[0], label="У тихих тактах (0)")
-            p_mid = gr.Dropdown(pattern_choices, value=native_arrange.DEFAULT_PATTERNS[1], label="У середніх тактах (1)")
-            p_loud = gr.Dropdown(pattern_choices, value=native_arrange.DEFAULT_PATTERNS[2], label="У гучних тактах (2)")
-        with gr.Accordion("Додатково", open=False):
+            p_quiet = gr.Dropdown(pattern_choices, value=native_arrange.DEFAULT_PATTERNS[0], label=tr("In quiet bars (0)"))
+            p_mid = gr.Dropdown(pattern_choices, value=native_arrange.DEFAULT_PATTERNS[1], label=tr("In middle bars (1)"))
+            p_loud = gr.Dropdown(pattern_choices, value=native_arrange.DEFAULT_PATTERNS[2], label=tr("In loud bars (2)"))
+        with gr.Accordion(tr("Advanced"), open=False):
             with gr.Row():
-                human = gr.Slider(0, 3, 1.0, step=0.1, label="«Людськість» таймінгу",
-                                  info="0 = точно по сітці, як машина; 1 = типово; більше = недбаліше.")
-                max_shift = gr.Slider(0, 6, 3, step=1, label="Найбільший зсув семпла гітари, півтонів",
-                                      info="Менше = природніший тембр, але потрібні семпли поруч за висотою.")
-                orig_drums = gr.Slider(0, 1.5, 0.0, step=0.05, label="Оригінальні барабани",
-                                       info="0 = замінені семплами; можна лишити частково для склейки.")
+                human = gr.Slider(0, 3, 1.0, step=0.1, label=tr("“Human” timing"),
+                                  info=tr("0 = exactly on the grid, like a machine; 1 = typical; more = sloppier."))
+                max_shift = gr.Slider(0, 6, 3, step=1, label=tr("Largest pitch shift of a guitar sample, semitones"),
+                                      info=tr("Less = a more natural tone, but samples close in pitch are needed."))
+                orig_drums = gr.Slider(0, 1.5, 0.0, step=0.05, label=tr("Original drums"),
+                                       info=tr("0 = replaced by samples; can be kept partly to glue the mix."))
             with gr.Row():
-                double = gr.Checkbox(True, label="Дві гітари (дубль у панорамі)", info="Вимкнено = одна по центру.")
-                fills = gr.Checkbox(False, label="Філи", info="Перед гучнішим тактом остання доля стає снейр-роллом.")
-        with gr.Accordion("Рівні", open=False):
+                double = gr.Checkbox(True, label=tr("Two guitars (a double, panned apart)"), info=tr("Off = one in the centre."))
+                fills = gr.Checkbox(False, label=tr("Fills"), info=tr("Before a louder bar the last beat becomes a snare roll."))
+        with gr.Accordion(tr("Levels"), open=False):
             with gr.Row():
-                g_voc = gr.Slider(0, 2, 1.0, step=0.05, label="Вокал оригіналу")
-                g_bas = gr.Slider(0, 2, 1.0, step=0.05, label="Бас оригіналу")
-                g_oth = gr.Slider(0, 2, 0.0, step=0.05, label="Електроніка оригіналу",
-                                  info="0 = прибрана: її місце займають гітари.")
+                g_voc = gr.Slider(0, 2, 1.0, step=0.05, label=tr("Original vocals"))
+                g_bas = gr.Slider(0, 2, 1.0, step=0.05, label=tr("Original bass"),
+                                  info=tr("With “Bass from the bank” ticked, this is the level of the bank's bass."))
+                g_oth = gr.Slider(0, 2, 0.0, step=0.05, label=tr("Original electronics"),
+                                  info=tr("0 = removed: the guitars take its place."))
             with gr.Row():
-                g_gtr = gr.Slider(0, 2, 1.0, step=0.05, label="Гітари", info="1 = типовий баланс до вокалу.")
-                g_drm = gr.Slider(0, 2, 1.0, step=0.05, label="Барабани", info="Оригінальні барабани замінено завжди.")
-                crash = gr.Checkbox(True, label="Креш на початку гучнішого розділу")
-        play_btn = gr.Button("Зіграти", variant="primary")
+                g_gtr = gr.Slider(0, 2, 1.0, step=0.05, label=tr("Guitars"), info=tr("1 = the typical balance against the vocals."))
+                g_drm = gr.Slider(0, 2, 1.0, step=0.05, label=tr("Drums"), info=tr("The original drums are always replaced."))
+                crash = gr.Checkbox(True, label=tr("Crash at the start of a louder section"))
+        play_btn = gr.Button(tr("Play"), variant="primary")
         summary = gr.Markdown("")
         out_now = gr.Markdown("")
         out_player = gr.Audio(show_label=False, interactive=False, autoplay=True)
-        history = gr.Dropdown(outs0, value=outs0[0][1] if outs0 else None, label="Попередні результати (нові зверху)")
+        history = gr.Dropdown(outs0, value=outs0[0][1] if outs0 else None, label=tr("Previous results (newest first)"))
 
         song_out = [root_box, map_tbl, start, refs, listen_ref, drum_track, guitar_track, cmp_drums, cmp_guitar, sample, history,
                     bank_msg]
         opts = [p_quiet, p_mid, p_loud, human, max_shift, double, fills]
         play_in = [drum_track, guitar_track, start, length, whole, seed, g_voc, g_bas, g_oth, g_gtr, g_drm, crash,
-                   orig_drums, *opts]
+                   orig_drums, bass_ref, *opts]
         cmp_in = [start, length, whole, seed, *opts]
-        base_browse.click(lambda: browse("Оберіть пісню"), None, base_path)
+        base_browse.click(lambda: browse(tr("Pick a song")), None, base_path)
         base_load.click(load_song, base_path, song_out)
         open_btn.click(open_root)
         analyse_btn.click(show_map, None, [analysis, map_tbl])
@@ -619,6 +638,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=7860)
     ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--lang", default=None, help="interface language (locales/<lang>.json); default: UI_LANG, else the OS language")
     a = ap.parse_args()
+    i18n.set_language(a.lang or i18n.detect())
     build().queue().launch(server_name="127.0.0.1", server_port=a.port, inbrowser=not a.no_browser, show_error=True,
                            head=HEAD)
