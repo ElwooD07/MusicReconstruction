@@ -247,7 +247,7 @@ def restore():
 
 
 def map_headers():
-    return [tr("bar"), tr("time"), tr("chord, 1st half"), tr("chord, 2nd half"), tr("energy 0-2")]
+    return [tr("bar"), tr("time"), tr("chord, 1st half"), tr("chord, 2nd half"), tr("section 0-2")]
 
 
 FLATS = {"Db": "C#", "Eb": "D#", "Gb": "F#", "Ab": "G#", "Bb": "A#"}
@@ -284,7 +284,7 @@ def show_map(progress=gr.Progress()):
     g = song["grid"]
     n_edit = sum(map(len, native_arrange.load_edits(state["root"]).values()))
     return (tr("**Grid:** {bpm} BPM (the drums fit the grid {fit}%), {bars} bars. User corrections: {edits}.  \n"
-               "The guitars play the chord roots from the table; the pattern depends on the bar's energy.",
+               "The guitars play the chord roots from the table; the pattern and the drum and bass levels depend on the bar's section.",
                bpm=f"{g['bpm']:.2f}", fit=f"{100 * g['coherence']:.0f}", bars=song["n_bars"], edits=n_edit),
             map_rows())
 
@@ -305,7 +305,7 @@ def save_map(rows):
                 edits["roots"][str(k)] = pc
         lv = int(float(r[4]))
         if lv not in (0, 1, 2):
-            raise gr.Error(tr("Bar {bar}: energy must be 0, 1 or 2.", bar=b))
+            raise gr.Error(tr("Bar {bar}: the section must be 0, 1 or 2.", bar=b))
         if lv != auto["level"][b]:
             edits["levels"][str(b)] = lv
     native_arrange.save_edits(state["root"], edits)
@@ -507,10 +507,10 @@ def build():
             open_btn = gr.Button(tr("Open folder"), scale=1)
         with gr.Row():
             analyse_btn = gr.Button(tr("What the program understands about the song"), scale=1)
-            analysis = gr.Markdown(tr("Grid and bar map (chords and energy); correct it below."))
-        with gr.Accordion(tr("Song map: chords and energy per bar (correct what is wrong)"), open=False):
-            gr.Markdown(tr("The program guessed the chord root for every half bar and the bar's “energy” (0 quiet, 1 middle, 2 loud): "
-                           "the guitar pattern and the crash depend on it. The guitars play exactly these chords, so a wrong root = "
+            analysis = gr.Markdown(tr("Grid and bar map (chords and sections); correct it below."))
+        with gr.Accordion(tr("Song map: chords and section per bar (correct what is wrong)"), open=False):
+            gr.Markdown(tr("The program guessed the chord root for every half bar and the bar's section (0 = nobody sings: intro or gap, 1 = verse, 2 = chorus: the louder sung bars). "
+                           "The guitar pattern, the drum and bass levels and the crash depend on it. The guitars play exactly these chords, so a wrong root = "
                            "a wrong note. Fix the cells (a note: A, C#, Bb…) and press “Save corrections”. A click on a row puts "
                            "the start of the fragment on that bar."))
             map_tbl = gr.Dataframe(map_rows(), headers=map_headers(), datatype=["number", "str", "str", "str", "number"],
@@ -570,12 +570,12 @@ def build():
                                info=tr("The song's electronic bass is replaced: the same line of notes is played with the bass notes "
                                        "of the “Guitars from” track. The level is “Original bass”. The first time the song's bass is "
                                        "transcribed (~30 s), then it comes from the cache."))
-        gr.Markdown(tr("Guitar pattern by the bar's energy (see the song map):"))
+        gr.Markdown(tr("Guitar pattern by the bar's section (see the song map):"))
         pattern_choices = [(tr(label), key) for key, (label, _, _) in native_arrange.PATTERN_LIBRARY.items()]
         with gr.Row():
-            p_quiet = gr.Dropdown(pattern_choices, value=native_arrange.DEFAULT_PATTERNS[0], label=tr("In quiet bars (0)"))
-            p_mid = gr.Dropdown(pattern_choices, value=native_arrange.DEFAULT_PATTERNS[1], label=tr("In middle bars (1)"))
-            p_loud = gr.Dropdown(pattern_choices, value=native_arrange.DEFAULT_PATTERNS[2], label=tr("In loud bars (2)"))
+            p_quiet = gr.Dropdown(pattern_choices, value=native_arrange.DEFAULT_PATTERNS[0], label=tr("Nobody sings (0)"))
+            p_mid = gr.Dropdown(pattern_choices, value=native_arrange.DEFAULT_PATTERNS[1], label=tr("Verse (1)"))
+            p_loud = gr.Dropdown(pattern_choices, value=native_arrange.DEFAULT_PATTERNS[2], label=tr("Chorus (2)"))
         with gr.Accordion(tr("Advanced"), open=False):
             with gr.Row():
                 human = gr.Slider(0, 3, 1.0, step=0.1, label=tr("“Human” timing"),

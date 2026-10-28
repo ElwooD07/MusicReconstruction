@@ -164,6 +164,26 @@ def chord_roots(bass, other, grid, n_bars, per_bar=2):
     return roots, conf
 
 
+def median_filter(x, half):
+    """Running median over +-half neighbours (the ends use what exists)."""
+    x = np.asarray(x)
+    return np.array([int(np.median(x[max(0, i - half):i + half + 1])) for i in range(len(x))])
+
+
+def section_levels(energy):
+    """The form of the song per bar: 0 = nobody sings (intro, gaps), 1 = sung, quieter half (verse), 2 = sung, louder half (chorus).
+
+    This is the "plot" the reference tracks follow (measured on the stems of 8 tracks, see README): the band answers the
+    voice, the drums and the bass lift in the chorus and drop in the gaps. The song's own backing layer cannot give it:
+    in the test song the synth is loudest exactly where nobody sings."""
+    db = lambda k: 20 * np.log10(np.array([e[k] for e in energy]) + 1e-6)
+    v, o, d = db("vocals"), db("other"), db("drums")
+    sung = median_filter(v > np.percentile(v, 95) - 18, 1).astype(bool)             # a vocal stem leaks a little: 18 dB below its peak
+    total = 10 * np.log10(10 ** (v / 10) + 10 ** (o / 10) + 10 ** (d / 10))
+    loud = total >= np.median(total[sung]) if sung.any() else np.zeros(len(v), bool)
+    return median_filter(np.where(~sung, 0, np.where(loud, 2, 1)), 2)                # no flicker
+
+
 def bar_energy(other, vocals, drums, grid, n_bars):
     """Per bar: RMS of the song's own backing layer, of the vocal and of the drums (linear)."""
     out = []

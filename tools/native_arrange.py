@@ -32,7 +32,7 @@ import soundfile as sf
 import native_song as ns
 from native_bank import NOTES, SR, bass_notes, load
 
-ANALYSIS_VERSION = 3
+ANALYSIS_VERSION = 4
 
 
 def tr_noop(text):
@@ -59,6 +59,7 @@ PATTERN_LIBRARY = {
 }
 DEFAULT_PATTERNS = {0: "long", 1: "eighths_kick", 2: "sync"}      # by energy level of the bar: quiet / middle / loud
 LEVEL_GAIN = {0: 0.8, 1: 0.9, 2: 1.0}
+RHYTHM_GAIN = {0: 0.7, 1: 0.85, 2: 1.0}               # drums and bass by section: lower in the gaps, lift in the chorus (about -3 / -1.4 / 0 dB)
 HUMAN = {"kick": (0.003, 0.0), "snare": (0.004, 0.004), "hat": (0.005, 0.0), "crash": (0.0, 0.0)}   # sigma, mean delay (s)
 DRUM_GAIN = {"kick": 1.0, "snare": 1.0, "hat": 0.5, "crash": 0.7}
 
@@ -87,10 +88,7 @@ def analyse(root):
     hits = ns.transcribe_drums(d, grid)
     roots, conf = ns.chord_roots(b, o, grid, n_bars)
     energy = ns.bar_energy(o, v, d, grid, n_bars)
-    db = 20 * np.log10(np.array([e["other"] for e in energy]) + 1e-6)
-    lo, hi = np.percentile(db, [30, 70])
-    level = np.where(db <= lo, 0, np.where(db >= hi, 2, 1))
-    level = np.array([int(np.median(level[max(0, i - 1):i + 2])) for i in range(len(level))])      # no flicker
+    level = ns.section_levels(energy)
     out = dict(version=ANALYSIS_VERSION, mtime=os.path.getmtime(drums_path), grid=grid, n_bars=n_bars, hits=hits,
                roots=roots, level=[int(x) for x in level], energy=energy)
     os.makedirs(os.path.dirname(cache), exist_ok=True)
@@ -275,7 +273,8 @@ def render_drums(song, bank, rng, n, crash, t0=0.0, human=1.0, fills=False):
         t = g["bar0"] + k * g["step"] + delay * human + rng.normal(0, sigma * human) - t0
         y, att = bank.audio(sample)
         base = 0.55 if cls != "hat" else 0.35
-        place(buf, y, att, t, DRUM_GAIN[cls] * (base + (1 - base) * min(vel, 1.0)) * rng.uniform(0.93, 1.07))
+        section = RHYTHM_GAIN[lv[min(max(k // 16, 0), len(lv) - 1)]]
+        place(buf, y, att, t, section * DRUM_GAIN[cls] * (base + (1 - base) * min(vel, 1.0)) * rng.uniform(0.93, 1.07))
     if crash:
         for b in range(1, len(lv)):
             if lv[b] > lv[b - 1] and lo <= g["bar0"] + b * g["bar"] <= hi:
@@ -339,7 +338,7 @@ def song_bass(root):
     return notes
 
 
-def render_bass(notes, bank, rng, n, t0=0.0, human=1.0):
+def render_bass(song, notes, bank, rng, n, t0=0.0, human=1.0):
     """Bass bus of n frames from t0: the song's own bass line (times, pitches, lengths) played with the bank's bass notes."""
     buf = np.zeros((n, 2), dtype=np.float32)
     top = np.percentile([x["rms"] for x in notes], 90) if notes else 1.0
@@ -351,7 +350,9 @@ def render_bass(notes, bank, rng, n, t0=0.0, human=1.0):
         if sample is None:
             continue
         y, att = bank.audio(sample, shift)
-        gain = (0.55 + 0.45 * min(x["rms"] / top, 1.0)) * rng.uniform(0.95, 1.05)
+        g = song["grid"]
+        section = RHYTHM_GAIN[song["level"][min(max(int((x["t"] - g["bar0"]) // g["bar"]), 0), len(song["level"]) - 1)]]
+        gain = section * (0.55 + 0.45 * min(x["rms"] / top, 1.0)) * rng.uniform(0.95, 1.05)
         place(buf, y, att, t + rng.normal(0, 0.003 * human), gain, int((min(x["length"], 1.5) + 0.03) * SR))
     return buf
 
@@ -391,7 +392,7 @@ def arrange(root, tracks=(), start=0.0, length=0.0, seed=1, tag="", vocals=1.0, 
     v_rms = active_rms(voc)
     mix = vocals * voc + (0.0 if bass_ref else bass) * bass_stem + keep_other * other + orig_drums * orig_d
     if bass_ref:
-        bass_bus = render_bass(song_bass(root), bank, rng, n, a, human)
+        bass_bus = render_bass(song, song_bass(root), bank, rng, n, a, human)
         mix += bass_bus * (bass * 0.8 * v_rms / active_rms(bass_bus))
     if "drums" in parts:
         drum_bus = render_drums(song, bank, rng, n, crash, a, human, fills)
@@ -418,7 +419,7 @@ def arrange(root, tracks=(), start=0.0, length=0.0, seed=1, tag="", vocals=1.0, 
         f"Drums from: {', '.join(drum_tracks)} {drum_counts}.",
         f"Guitars from: {', '.join(gtr_tracks)} ({len(bank.guitar)} slices).",
         *([f"Bass: the song's line, notes from {', '.join(bass_names)} ({len(bank.bass)} notes)."] if bass_ref else []),
-        f"Grid {g['bpm']:.2f} BPM, {song['n_bars']} bars, energy low/middle/high = {lv.tolist()}."])
+        f"Grid {g['bpm']:.2f} BPM, {song['n_bars']} bars, sections nobody sings/verse/chorus = {lv.tolist()}."])
     return out, text
 
 
